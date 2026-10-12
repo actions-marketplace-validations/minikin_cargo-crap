@@ -21,8 +21,8 @@ use cargo_crap::{
     duplicates::triage::verdict::Assessment,
     merge::{MissingCoveragePolicy, ScopeDiagnostics, SortOrder, merge, sort_entries},
     report::{
-        self, Format, RenderOptions, SourceLinks, crappy_count, output_width, render, render_delta,
-        render_delta_counts, render_summary, set_color_enabled,
+        self, Format, RenderOptions, SourceLinks, TriagedBy, crappy_count, output_width, render,
+        render_delta, render_delta_counts, render_summary, set_color_enabled,
     },
     score::DEFAULT_THRESHOLD,
 };
@@ -962,8 +962,10 @@ fn resolve_color(
     }
 }
 
-/// Open the output destination: a file when `--output` is given, stdout otherwise.
-fn open_output(path: Option<&PathBuf>) -> Result<Box<dyn Write>> {
+/// Prepare the output destination: set the process-wide colour policy for
+/// it, then open it, a file when `--output` is given and stdout otherwise.
+fn prepare_output(path: Option<&PathBuf>) -> Result<Box<dyn Write>> {
+    apply_color_policy(path.is_some());
     Ok(match path {
         Some(p) => {
             Box::new(BufWriter::new(File::create(p).with_context(|| {
@@ -1366,19 +1368,8 @@ struct DupSettings {
     /// Whether to ask the model about each reported pair.
     triage_enabled: bool,
     /// The API to ask, resolved from its configured id.
-    #[cfg_attr(
-        not(feature = "triage"),
-        expect(
-            dead_code,
-            reason = "only a build with the triage client asks a provider"
-        )
-    )]
     triage_provider: &'static dyn Provider,
     /// The model to ask.
-    #[cfg_attr(
-        not(feature = "triage"),
-        expect(dead_code, reason = "only a build with the triage client asks a model")
-    )]
     triage_model: String,
     /// Confidence below which a triage verdict names no kind. Carried here,
     /// range-checked with the threshold, so the triage pass reads the value
@@ -1457,12 +1448,15 @@ fn duplicate_pairs(
     if !settings.enabled {
         return Ok(None);
     }
-    // Only two formats can carry the pairs. Paying for a quadratic sweep and
+    // Only four formats can carry the pairs. Paying for a quadratic sweep and
     // then discarding it silently is worse than saying so and skipping it.
-    if !matches!(format, Format::Human | Format::Json) {
+    if !matches!(
+        format,
+        Format::Human | Format::Json | Format::Markdown | Format::PrComment
+    ) {
         eprintln!(
             "warning: --duplicates has no effect with this format; \
-             use --format human or --format json"
+             use --format human, json, markdown or pr-comment"
         );
         return Ok(None);
     }
@@ -1481,25 +1475,45 @@ fn duplicate_pairs(
 }
 
 /// The duplicate section's content: the pairs, and their triage when it ran.
-struct DuplicateSection {
+struct DuplicateSection<'a> {
     pairs: Option<Vec<DuplicatePair>>,
     triage: Option<Vec<Assessment>>,
+    /// The display name of the provider asked, named when triage answered.
+    provider: &'static str,
+    /// The model asked.
+    model: &'a str,
+}
+
+impl DuplicateSection<'_> {
+    /// Who answered the triage: the provider and the model asked, when
+    /// triage produced assessments.
+    fn triaged_by(&self) -> Option<TriagedBy<'_>> {
+        self.triage.as_ref().map(|_| TriagedBy {
+            provider: self.provider,
+            model: self.model,
+        })
+    }
 }
 
 /// Find the duplicate pairs, then triage them when configured to. Triage
 /// only ever sees pairs that will be reported, so a format that cannot
 /// carry duplicates never triggers a request.
-fn duplicate_section(
-    settings: &DupSettings,
+fn duplicate_section<'a>(
+    settings: &'a DupSettings,
     roots: &[ScanRoot],
     format: Format,
     target: Option<&Path>,
-) -> Result<DuplicateSection> {
+) -> Result<DuplicateSection<'a>> {
     let pairs = duplicate_pairs(settings, roots, format)?;
     let triage = pairs
         .as_deref()
         .and_then(|pairs| triage_assessments(settings, pairs, target));
-    Ok(DuplicateSection { pairs, triage })
+    Ok(DuplicateSection {
+        pairs,
+        triage,
+        provider: settings.triage_provider.display_name(),
+        model: &settings.triage_model,
+    })
 }
 
 /// Ask the model about `pairs` when triage is enabled, and hold each verdict
@@ -1603,6 +1617,7 @@ fn do_render(
 fn resolve_source_links(
     cli_repo_url: Option<String>,
     cli_commit_ref: Option<String>,
+    root: &Path,
 ) -> Option<SourceLinks> {
     let repo_url = cli_repo_url.or_else(|| {
         let server = std::env::var("GITHUB_SERVER_URL").ok()?;
@@ -1614,7 +1629,7 @@ fn resolve_source_links(
         ))
     })?;
     let commit_ref = cli_commit_ref.or_else(|| std::env::var("GITHUB_SHA").ok())?;
-    Some(SourceLinks::new(repo_url, commit_ref))
+    Some(SourceLinks::new(repo_url, commit_ref).with_root(root.to_path_buf()))
 }
 
 /// Parse argv, validate flag combinations, and load the optional
@@ -1812,9 +1827,8 @@ fn run() -> Result<ExitCode> {
     )?;
 
     // --- Render ---
-    apply_color_policy(cli.output.is_some());
-    let mut out_box = open_output(cli.output.as_ref())?;
-    let links = resolve_source_links(cli.repo_url, cli.commit_ref);
+    let mut out_box = prepare_output(cli.output.as_ref())?;
+    let links = resolve_source_links(cli.repo_url, cli.commit_ref, &knobs.cwd);
     let dups = duplicate_section(&dup, &roots, cli.format.into(), target.as_deref())?;
     let opts = RenderOpts {
         render: RenderOptions {
@@ -1824,12 +1838,14 @@ fn run() -> Result<ExitCode> {
             diagnostics: diagnostics.as_ref(),
             show_unchanged,
             uncovered_hints,
-            duplicates: dups.pairs.as_deref(),
             try_weight,
-            triage: dups.triage.as_deref(),
             sliced: is_sliced(min, top),
             delta_counts: None,
             width: output_width(cli.output.is_none()),
+            cwd: &knobs.cwd,
+            duplicates: dups.pairs.as_deref(),
+            triage: dups.triage.as_deref(),
+            triaged_by: dups.triaged_by(),
         },
         epsilon,
         summary: cli.summary,

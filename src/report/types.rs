@@ -12,7 +12,8 @@ use crate::coverage::LineRange;
 use crate::delta::{DeltaCounts, DeltaEntry, DeltaStatus};
 use comfy_table::Color;
 use std::borrow::Cow;
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use unicode_width::UnicodeWidthStr;
 
@@ -107,17 +108,20 @@ pub(crate) fn coverage_cell(
         (None, 0) => "—".to_owned(),
         (Some(p), 0) => format!("{p:>5.1}%"),
         (None, cells) => format!("{}    —", "░".repeat(cells)),
-        (Some(p), cells) => {
-            let filled = ((p / 100.0) * cells as f64).round() as usize;
-            let filled = filled.min(cells);
-            format!(
-                "{}{} {:>5.1}%",
-                "█".repeat(filled),
-                "░".repeat(cells - filled),
-                p
-            )
-        },
+        (Some(p), cells) => format!("{} {p:>5.1}%", bar(p / 100.0, cells, "█", "░")),
     }
+}
+
+/// A `cells`-wide bar, `full` up to `fraction` rounded to the nearest cell
+/// and `empty` after it. A fraction past 1 fills every cell.
+pub(crate) fn bar(
+    fraction: f64,
+    cells: usize,
+    full: &str,
+    empty: &str,
+) -> String {
+    let filled = ((fraction * cells as f64).round() as usize).min(cells);
+    format!("{}{}", full.repeat(filled), empty.repeat(cells - filled))
 }
 
 /// Render a cyclomatic complexity as text: rounded to one decimal, with a
@@ -312,6 +316,28 @@ pub(crate) fn shorten_location(
     let (current, tail) = location.split_at(arrow);
     let current = shorten_path(current, budget.saturating_sub(tail.width()));
     Cow::Owned(format!("{current}{tail}"))
+}
+
+/// Write the footer of a section capped below its full length, counting the
+/// rows left out.
+pub(crate) fn write_truncation_footer(
+    out: &mut dyn Write,
+    omitted: usize,
+) -> anyhow::Result<()> {
+    writeln!(out)?;
+    writeln!(
+        out,
+        "_…and {omitted} more, see CI artifact for the full report._"
+    )?;
+    Ok(())
+}
+
+/// `path` relative to `cwd` when it is under it, else `path` as given.
+pub(crate) fn cwd_relative<'a>(
+    path: &'a Path,
+    cwd: &Path,
+) -> &'a Path {
+    path.strip_prefix(cwd).unwrap_or(path)
 }
 
 /// What separates a moved row's current location from its previous file.
@@ -762,5 +788,33 @@ mod tests {
                 prop_assert!(width <= budget, "{} wider than {}", short, budget);
             }
         }
+    }
+
+    #[test]
+    fn a_path_under_the_working_directory_is_shown_relative_to_it() {
+        let cwd = Path::new("/work");
+        assert_eq!(
+            cwd_relative(Path::new("/work/src/a.rs"), cwd),
+            Path::new("src/a.rs")
+        );
+        assert_eq!(
+            cwd_relative(Path::new("/elsewhere/a.rs"), cwd),
+            Path::new("/elsewhere/a.rs")
+        );
+        assert_eq!(
+            cwd_relative(Path::new("./src/a.rs"), cwd),
+            Path::new("./src/a.rs")
+        );
+    }
+
+    #[test]
+    fn a_bar_fills_to_the_nearest_cell() {
+        assert_eq!(bar(0.0, 5, "▰", "▱"), "▱▱▱▱▱");
+        assert_eq!(bar(0.09, 5, "▰", "▱"), "▱▱▱▱▱");
+        assert_eq!(bar(0.1, 5, "▰", "▱"), "▰▱▱▱▱");
+        assert_eq!(bar(0.85, 5, "▰", "▱"), "▰▰▰▰▱");
+        assert_eq!(bar(1.0, 5, "▰", "▱"), "▰▰▰▰▰");
+        assert_eq!(bar(1.5, 5, "▰", "▱"), "▰▰▰▰▰", "never past the last cell");
+        assert_eq!(bar(0.5, 10, "█", "░"), "█████░░░░░");
     }
 }

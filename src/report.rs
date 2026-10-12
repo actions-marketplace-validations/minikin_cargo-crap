@@ -24,6 +24,7 @@ use crate::merge::{CrapEntry, ScopeDiagnostics};
 use crate::score::Severity;
 use anyhow::{Result, bail};
 use std::io::Write;
+use std::path::Path;
 
 pub mod duplicates;
 mod github;
@@ -117,8 +118,8 @@ pub struct RenderOptions<'a> {
     pub uncovered_hints: bool,
     /// Candidate duplicate pairs, already ordered. `None` means detection
     /// was not asked for. Read by the JSON renderer, which embeds them in
-    /// its envelope, and by [`render_duplicates`], which appends the human
-    /// section; no other format carries duplicates.
+    /// its envelope, and by [`render_duplicates`], which appends the human,
+    /// markdown and pr-comment sections.
     pub duplicates: Option<&'a [DuplicatePair]>,
     /// The `?` weight the entries were analyzed under. Only the JSON
     /// renderers read it, recording it in the envelope when it is not
@@ -127,7 +128,8 @@ pub struct RenderOptions<'a> {
     /// One triage assessment per duplicate pair, in the pairs' order, or
     /// `None` when triage did not run. Read by the JSON renderer, which puts
     /// each verdict beside its pair, and by [`render_duplicates`], which
-    /// prints the human triage lines; no other format carries it.
+    /// prints the human triage lines and the markdown and pr-comment verdict
+    /// columns.
     pub triage: Option<&'a [Assessment]>,
     /// The user asked for a slice of the entries with `top` or `min`, on the
     /// command line or in config. The human table then draws every entry it
@@ -143,12 +145,28 @@ pub struct RenderOptions<'a> {
     /// for no limit (see [`output_width`]). Only the human renderer reads
     /// it.
     pub width: Option<usize>,
+    /// The working directory, resolved once by the caller: the duplicate
+    /// table shows paths relative to it. Empty shows every path as given.
+    pub cwd: &'a Path,
+    /// Who answered the triage, when it produced assessments. The markdown
+    /// and pr-comment duplicate tables name them under a triaged table.
+    pub triaged_by: Option<TriagedBy<'a>>,
+}
+
+/// The provider and model that judged the duplicate pairs.
+#[derive(Debug, Clone, Copy)]
+pub struct TriagedBy<'a> {
+    /// The provider's display name, such as `OpenAI API`.
+    pub provider: &'a str,
+    /// The model asked, such as `gpt-6-luna`.
+    pub model: &'a str,
 }
 
 impl Default for RenderOptions<'_> {
     /// CLI defaults: threshold 30, human format, no links, no
     /// diagnostics, changed-only delta rows, no uncovered hints, no
-    /// duplicates, the classical `?` weight, a capped human table.
+    /// duplicates, the classical `?` weight, a capped human table, no
+    /// working directory, so paths show as given, and no triage provider.
     fn default() -> Self {
         Self {
             threshold: crate::score::DEFAULT_THRESHOLD,
@@ -163,6 +181,8 @@ impl Default for RenderOptions<'_> {
             sliced: false,
             delta_counts: None,
             width: None,
+            cwd: Path::new(""),
+            triaged_by: None,
         }
     }
 }
@@ -188,13 +208,18 @@ pub fn render(
             opts.width,
             out,
         ),
-        Format::GitHub => github::render_github(entries, threshold, out),
+        Format::GitHub => github::render_github(entries, threshold, opts.cwd, out),
         Format::Markdown => {
             markdown::render_markdown(entries, threshold, opts.links, opts.uncovered_hints, out)
         },
-        Format::PrComment => {
-            pr_comment::render_pr_comment(entries, threshold, opts.links, opts.uncovered_hints, out)
-        },
+        Format::PrComment => pr_comment::render_pr_comment(
+            entries,
+            threshold,
+            opts.links,
+            opts.uncovered_hints,
+            opts.cwd,
+            out,
+        ),
         Format::Sarif => sarif::render_sarif(entries, threshold, out),
         Format::Shields => shields::render_shields(entries, threshold, out),
     }
@@ -220,7 +245,7 @@ pub fn render_delta(
     match opts.format {
         Format::Json => json::render_delta_json(report, opts, out),
         Format::Human => human::render_delta_human(report, opts, &counts, out),
-        Format::GitHub => github::render_delta_github(report, threshold, out),
+        Format::GitHub => github::render_delta_github(report, threshold, opts.cwd, out),
         Format::Markdown => markdown::render_delta_markdown(
             report,
             threshold,
@@ -236,6 +261,7 @@ pub fn render_delta(
             opts.links,
             opts.uncovered_hints,
             &counts,
+            opts.cwd,
             out,
         ),
         // SARIF describes the *current* set of findings, not deltas. The
@@ -257,10 +283,11 @@ pub fn render_delta(
 /// second analysis rather than a second view of the same entries — it has to
 /// follow whichever table was printed, including the `--summary` one.
 ///
-/// `None` duplicates means detection was not asked for. Only `human` prints
-/// the section: JSON carries the pairs inside its envelope, where appending
-/// text after the document would leave the output unparseable, and no other
-/// format carries duplicates at all.
+/// `None` duplicates means detection was not asked for. `human` prints the
+/// text section, and `markdown` and `pr-comment` a GFM table, the PR
+/// comment's capped and left out when there is no pair. JSON carries the
+/// pairs inside its envelope, where appending text after the document would
+/// leave the output unparseable, and the other formats carry none.
 ///
 /// # Errors
 ///
@@ -272,11 +299,38 @@ pub fn render_duplicates(
     let Some(pairs) = opts.duplicates else {
         return Ok(());
     };
-    if !matches!(opts.format, Format::Human) {
-        return Ok(());
+    write_duplicate_section(pairs, opts, out)
+}
+
+/// The duplicate section in `opts.format`, for a run that asked for one.
+fn write_duplicate_section(
+    pairs: &[DuplicatePair],
+    opts: &RenderOptions,
+    out: &mut dyn Write,
+) -> Result<()> {
+    match opts.format {
+        Format::Human => {
+            writeln!(out)?;
+            duplicates::render(pairs, opts.triage, out)
+        },
+        Format::Markdown => duplicate_table(opts, None, out),
+        // A comment with nothing to say about duplicates says nothing.
+        Format::PrComment if pairs.is_empty() => Ok(()),
+        Format::PrComment => duplicate_table(opts, Some(pr_comment::MAX_ROWS_PER_SECTION), out),
+        Format::Json | Format::GitHub | Format::Sarif | Format::Shields => Ok(()),
     }
+}
+
+/// The GFM duplicate section, after a blank line, with each pair's verdict
+/// and who gave it when the triage covers every pair, and paths relative to
+/// the working directory.
+fn duplicate_table(
+    opts: &RenderOptions,
+    cap: Option<usize>,
+    out: &mut dyn Write,
+) -> Result<()> {
     writeln!(out)?;
-    duplicates::render(pairs, opts.triage, out)
+    duplicates::render_table(opts, cap, out)
 }
 
 /// Prepend the hidden HTML marker that lets CI identify and update the PR
