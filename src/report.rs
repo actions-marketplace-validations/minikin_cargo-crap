@@ -20,6 +20,7 @@
 use crate::delta::{DeltaCounts, DeltaReport};
 use crate::duplicates::compare::DuplicatePair;
 use crate::duplicates::group::DuplicateGroup;
+use crate::duplicates::novelty::Comparison;
 use crate::duplicates::triage::verdict::Assessment;
 use crate::merge::{CrapEntry, ScopeDiagnostics};
 use crate::score::Severity;
@@ -126,13 +127,15 @@ pub struct RenderOptions<'a> {
     /// renderers read it, recording it in the envelope when it is not
     /// [`DEFAULT_TRY_WEIGHT`](crate::config::DEFAULT_TRY_WEIGHT).
     pub try_weight: f64,
-    /// One triage assessment per duplicate group, in the groups' order, when
+    /// One triage verdict per duplicate group, in the groups' order, when
     /// `groups` is set, else one per pair in the pairs' order, or `None` when
-    /// triage did not run. The human section and the markdown and
-    /// pr-comment tables print one verdict per group. The JSON renderer
-    /// puts each beside its group, and beside each pair through
+    /// triage did not run. A group nobody asked about, such as one a delta
+    /// run's baseline already had, holds `None`. The human section prints
+    /// each verdict there is, and the markdown and pr-comment tables print
+    /// theirs when every row they show has one. The JSON renderer puts each
+    /// beside its group, and beside each pair through
     /// [`RenderOptions::pair_triage`].
-    pub triage: Option<&'a [Assessment]>,
+    pub triage: Option<&'a [Option<Assessment>]>,
     /// The user asked for a slice of the entries with `top` or `min`, on the
     /// command line or in config. The human table then draws every entry it
     /// is given instead of capping the rows below the threshold. Only the
@@ -157,6 +160,11 @@ pub struct RenderOptions<'a> {
     /// other, or `None` to report each pair on its own. Every section that
     /// shows duplicates reads it.
     pub groups: Option<&'a [DuplicateGroup]>,
+    /// The groups measured against a baseline's duplicate record, one status
+    /// per group, on a delta run whose baseline has one. The markdown and
+    /// pr-comment tables then show only the new and grown groups and count
+    /// the rest. Ignored unless it covers every group.
+    pub novelty: Option<&'a Comparison>,
 }
 
 /// The provider and model that judged the duplicate pairs.
@@ -186,7 +194,7 @@ impl<'a> RenderOptions<'a> {
     /// in. `None` when triage did not run, or when it does not cover every
     /// group or every pair, so no pair is shown another pair's verdict.
     #[must_use]
-    pub fn pair_triage(&self) -> Option<std::borrow::Cow<'a, [Assessment]>> {
+    pub fn pair_triage(&self) -> Option<std::borrow::Cow<'a, [Option<Assessment>]>> {
         let triage = self.triage?;
         let Some(groups) = self.groups else {
             return Some(std::borrow::Cow::Borrowed(triage));
@@ -222,6 +230,7 @@ impl Default for RenderOptions<'_> {
             cwd: Path::new(""),
             triaged_by: None,
             groups: None,
+            novelty: None,
         }
     }
 }
@@ -355,10 +364,21 @@ fn write_duplicate_section(
         },
         Format::Markdown => duplicate_table(opts, None, out),
         // A comment with nothing to say about duplicates says nothing.
-        Format::PrComment if groups.is_empty() => Ok(()),
+        Format::PrComment if nothing_new(groups, opts) => Ok(()),
         Format::PrComment => duplicate_table(opts, Some(pr_comment::MAX_ROWS_PER_SECTION), out),
         Format::Json | Format::GitHub | Format::Sarif | Format::Shields => Ok(()),
     }
+}
+
+/// True when no group is worth a PR comment: there are none, or a delta
+/// run reports none and resolved none.
+fn nothing_new(
+    groups: &[DuplicateGroup],
+    opts: &RenderOptions,
+) -> bool {
+    duplicates::covering_comparison(opts, groups.len()).map_or(groups.is_empty(), |c| {
+        c.resolved == 0 && c.reported().next().is_none()
+    })
 }
 
 /// The GFM duplicate section, after a blank line, with each group's
@@ -438,6 +458,46 @@ mod tests {
         }
 
         #[test]
+        fn a_pr_comment_with_nothing_new_has_no_duplicate_section() {
+            use crate::duplicates::novelty::{Comparison, Novelty};
+            let pairs = [pair(0), pair(1)];
+            let groups: Vec<DuplicateGroup> = pairs.iter().map(DuplicateGroup::of_pair).collect();
+            let render_resolving = |format: Format, novelty: Vec<Novelty>, resolved: usize| {
+                let comparison = Comparison { novelty, resolved };
+                let mut buf = Vec::new();
+                let opts = RenderOptions {
+                    format,
+                    duplicates: Some(&pairs),
+                    groups: Some(&groups),
+                    novelty: Some(&comparison),
+                    ..RenderOptions::default()
+                };
+                render_duplicates(&opts, &mut buf).unwrap();
+                String::from_utf8(buf).unwrap()
+            };
+            let render_with =
+                |format: Format, novelty: Vec<Novelty>| render_resolving(format, novelty, 0);
+            let unchanged = vec![Novelty::Unchanged; 2];
+            assert_eq!(render_with(Format::PrComment, unchanged.clone()), "");
+            assert!(
+                render_with(Format::Markdown, unchanged)
+                    .contains("## No new duplicate candidates\n"),
+                "markdown still says it looked"
+            );
+            let one_new = vec![Novelty::Unchanged, Novelty::New];
+            assert!(
+                render_with(Format::PrComment, one_new).contains("## 1 new duplicate candidate"),
+                "a new group is shown"
+            );
+            let credited = render_resolving(Format::PrComment, vec![Novelty::Unchanged; 2], 1);
+            assert!(
+                credited.contains("## No new duplicate candidates\n")
+                    && credited.contains("2 existing candidates unchanged, 1 resolved."),
+                "a resolved group is credited: {credited}"
+            );
+        }
+
+        #[test]
         fn every_text_section_reads_the_same_groups() {
             // No groups beside some pairs: each text format says there are
             // none, rather than one listing the pairs.
@@ -500,7 +560,7 @@ mod tests {
             let pairs = [pair(0, 1), pair(0, 2), pair(1, 2), pair(5, 6)];
             let groups = group_pairs(&pairs, 0.82);
             assert_eq!(groups.len(), 2);
-            let triage = [sure(0.1), sure(0.2)];
+            let triage = [sure(0.1), sure(0.2)].map(Some);
             let opts = RenderOptions {
                 duplicates: Some(&pairs),
                 groups: Some(&groups),
@@ -508,14 +568,14 @@ mod tests {
                 ..RenderOptions::default()
             };
             let by_pair = opts.pair_triage().expect("every pair covered");
-            let expected = [sure(0.1), sure(0.1), sure(0.1), sure(0.2)];
+            let expected = [sure(0.1), sure(0.1), sure(0.1), sure(0.2)].map(Some);
             assert_eq!(by_pair.as_ref(), expected);
         }
 
         #[test]
         fn without_groups_the_triage_is_already_per_pair() {
             let pairs = [pair(0, 1)];
-            let triage = [sure(0.4)];
+            let triage = [sure(0.4)].map(Some);
             let opts = RenderOptions {
                 duplicates: Some(&pairs),
                 triage: Some(&triage),
@@ -528,7 +588,7 @@ mod tests {
         fn a_triage_that_misses_a_group_or_a_pair_gives_none() {
             let pairs = [pair(0, 1), pair(5, 6)];
             let groups = group_pairs(&pairs, 0.82);
-            let one = [sure(0.3)];
+            let one = [sure(0.3)].map(Some);
             let short = RenderOptions {
                 duplicates: Some(&pairs),
                 groups: Some(&groups),
@@ -537,7 +597,7 @@ mod tests {
             };
             assert_eq!(short.pair_triage(), None, "one verdict, two groups");
             let stray = [pair(0, 1), pair(5, 6), pair(8, 9)];
-            let two = [sure(0.3), sure(0.4)];
+            let two = [sure(0.3), sure(0.4)].map(Some);
             let unmatched = RenderOptions {
                 duplicates: Some(&stray),
                 groups: Some(&groups),

@@ -8,6 +8,7 @@ use crate::delta::{DeltaEntry, DeltaReport};
 use crate::duplicates::compare::DuplicatePair;
 use crate::duplicates::extract::Location;
 use crate::duplicates::group::DuplicateGroup;
+use crate::duplicates::novelty::Novelty;
 use crate::duplicates::triage::verdict::Assessment;
 use crate::merge::{CrapEntry, ScopeDiagnostics};
 use crate::report::RenderOptions;
@@ -121,6 +122,52 @@ pub struct DuplicateGroupJson {
     pub triage: Option<TriageJson>,
 }
 
+/// A group in a delta report: the group, and what it is against the
+/// baseline's duplicate record when the baseline has one. Written only, so
+/// a delta report read back as a baseline ignores the labels, as it ignores
+/// each entry's delta status.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+struct DeltaGroupJson {
+    #[serde(flatten)]
+    group: DuplicateGroupJson,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<GroupStatus>,
+    /// The most of its members one baseline group held, on a grown group.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    grown_from: Option<usize>,
+}
+
+/// A group's status in a delta report, as the wire spells it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+enum GroupStatus {
+    /// No baseline group held two of its members.
+    New,
+    /// A baseline group held some of its members, none held all.
+    Grown,
+    /// One baseline group held every member.
+    Unchanged,
+}
+
+impl DeltaGroupJson {
+    /// `group` labelled with `novelty`, or unlabelled without one.
+    fn of(
+        group: DuplicateGroupJson,
+        novelty: Option<Novelty>,
+    ) -> Self {
+        let status = novelty.map(|n| match n {
+            Novelty::New => GroupStatus::New,
+            Novelty::Grown { .. } => GroupStatus::Grown,
+            Novelty::Unchanged => GroupStatus::Unchanged,
+        });
+        Self {
+            group,
+            status,
+            grown_from: novelty.and_then(Novelty::grown_from),
+        }
+    }
+}
+
 /// One member of a duplicate group.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MemberJson {
@@ -132,6 +179,18 @@ pub struct MemberJson {
     pub start_line: usize,
     /// Its last line, 1-indexed and inclusive.
     pub end_line: usize,
+}
+
+/// The member as a location, as a baseline's duplicate record is read.
+impl From<MemberJson> for Location {
+    fn from(member: MemberJson) -> Self {
+        Self {
+            file: member.file.into(),
+            start_line: member.start_line,
+            end_line: member.end_line,
+            name: member.function,
+        }
+    }
 }
 
 impl MemberJson {
@@ -209,10 +268,11 @@ impl DuplicateJson {
 }
 
 /// Flatten pairs for either envelope, preserving their order, each with its
-/// triage verdict when `triage` holds exactly one per pair.
+/// triage verdict when `triage` holds one entry per pair and that pair's
+/// entry is a verdict.
 fn wire(
     pairs: Option<&[DuplicatePair]>,
-    triage: Option<&[Assessment]>,
+    triage: Option<&[Option<Assessment>]>,
 ) -> Option<Vec<DuplicateJson>> {
     pairs.map(|pairs| {
         let verdict = verdicts(triage, pairs.len());
@@ -228,10 +288,11 @@ fn wire(
 }
 
 /// Flatten groups for either envelope, preserving their order, each with its
-/// triage verdict when `triage` holds exactly one per group.
+/// triage verdict when `triage` holds one entry per group and that group's
+/// entry is a verdict.
 fn wire_groups(
     groups: Option<&[DuplicateGroup]>,
-    triage: Option<&[Assessment]>,
+    triage: Option<&[Option<Assessment>]>,
 ) -> Option<Vec<DuplicateGroupJson>> {
     groups.map(|groups| {
         let verdict = verdicts(triage, groups.len());
@@ -251,17 +312,32 @@ fn wire_groups(
     })
 }
 
-/// The flattened verdict of item `n` of `count`. All or nothing, as in the
-/// human section: unless `triage` holds exactly one assessment per item, no
-/// item gets one, so a missing verdict is never read as another item's.
+/// [`wire_groups`] for a delta envelope: each group labelled with its
+/// status when `opts.novelty` has one per group.
+fn wire_delta_groups(opts: &RenderOptions) -> Option<Vec<DeltaGroupJson>> {
+    let groups = wire_groups(opts.groups, opts.triage)?;
+    let novelty =
+        super::duplicates::covering_comparison(opts, groups.len()).map(|c| c.novelty.as_slice());
+    Some(
+        groups
+            .into_iter()
+            .enumerate()
+            .map(|(n, group)| DeltaGroupJson::of(group, novelty.map(|s| s[n])))
+            .collect(),
+    )
+}
+
+/// The flattened verdict of item `n` of `count`, when it has one. Unless
+/// `triage` holds exactly one entry per item, no item gets one, so a
+/// missing verdict is never read as another item's.
 fn verdicts(
-    triage: Option<&[Assessment]>,
+    triage: Option<&[Option<Assessment>]>,
     count: usize,
 ) -> impl Fn(usize) -> Option<TriageJson> + '_ {
     let triage = triage.filter(|t| t.len() == count);
     move |n| {
         triage
-            .and_then(|t| t.get(n))
+            .and_then(|t| t[n].as_ref())
             .map(TriageJson::from_assessment)
     }
 }
@@ -304,7 +380,7 @@ pub(crate) fn render_delta_json(
         #[serde(skip_serializing_if = "Option::is_none")]
         duplicates: Option<Vec<DuplicateJson>>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        duplicate_groups: Option<Vec<DuplicateGroupJson>>,
+        duplicate_groups: Option<Vec<DeltaGroupJson>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         try_weight: Option<f64>,
     }
@@ -317,7 +393,7 @@ pub(crate) fn render_delta_json(
             removed: &report.removed,
             diagnostics: opts.diagnostics,
             duplicates: wire(opts.duplicates, opts.pair_triage().as_deref()),
-            duplicate_groups: wire_groups(opts.groups, opts.triage),
+            duplicate_groups: wire_delta_groups(opts),
             try_weight: recorded_try_weight(opts.try_weight),
         },
     )?;
@@ -511,13 +587,14 @@ mod tests {
         pairs: &[DuplicatePair],
         triage: Option<&[crate::duplicates::triage::verdict::Assessment]>,
     ) -> serde_json::Value {
+        let triage = triage.map(super::super::test_support::every);
         let mut buf = Vec::new();
         render(
             &sample(),
             &RenderOptions {
                 format: Format::Json,
                 duplicates: Some(pairs),
-                triage,
+                triage: triage.as_deref(),
                 ..Default::default()
             },
             &mut buf,
@@ -582,7 +659,7 @@ mod tests {
         use super::super::test_support::fractional_cc_delta;
         use crate::duplicates::triage::verdict::Assessment;
         let pairs = one_pair();
-        let triage = [Assessment::Uncertain { confidence: 0.4 }];
+        let triage = [Some(Assessment::Uncertain { confidence: 0.4 })];
         let mut buf = Vec::new();
         render_delta(
             &fractional_cc_delta(),
@@ -655,11 +732,12 @@ mod tests {
         triage: Option<&[Assessment]>,
     ) -> serde_json::Value {
         let (pairs, groups) = two_groups();
+        let triage = triage.map(super::super::test_support::every);
         let opts = RenderOptions {
             format: Format::Json,
             duplicates: Some(&pairs),
             groups: Some(&groups),
-            triage,
+            triage: triage.as_deref(),
             ..Default::default()
         };
         let mut buf = Vec::new();
@@ -720,6 +798,94 @@ mod tests {
                 group.get("triage").is_none(),
                 "one verdict, two groups: {short}"
             );
+        }
+    }
+
+    #[test]
+    fn a_group_nobody_asked_about_has_no_verdict_and_neither_do_its_pairs() {
+        let (pairs, groups) = two_groups();
+        let triage = [None, Some(SECOND)];
+        let opts = RenderOptions {
+            format: Format::Json,
+            duplicates: Some(&pairs),
+            groups: Some(&groups),
+            triage: Some(&triage),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        render(&sample(), &opts, &mut buf).unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        assert!(doc["duplicate_groups"][0].get("triage").is_none(), "{doc}");
+        assert_eq!(doc["duplicate_groups"][1]["triage"]["confidence"], 0.7);
+        let confidences: Vec<Option<f64>> = doc["duplicates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["triage"]["confidence"].as_f64())
+            .collect();
+        assert_eq!(confidences, [None, None, None, Some(0.7)]);
+    }
+
+    /// The JSON of `two_groups` as a delta run with `novelty` writes it, or
+    /// as a plain report when `delta` is false.
+    fn labelled_doc(
+        delta: bool,
+        novelty: &[crate::duplicates::novelty::Novelty],
+    ) -> serde_json::Value {
+        let (pairs, groups) = two_groups();
+        let comparison = crate::duplicates::novelty::Comparison {
+            novelty: novelty.to_vec(),
+            resolved: 0,
+        };
+        let opts = RenderOptions {
+            format: Format::Json,
+            duplicates: Some(&pairs),
+            groups: Some(&groups),
+            novelty: Some(&comparison),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        if delta {
+            super::super::render_delta(
+                &super::super::test_support::fractional_cc_delta(),
+                &opts,
+                &mut buf,
+            )
+            .unwrap();
+        } else {
+            render(&sample(), &opts, &mut buf).unwrap();
+        }
+        serde_json::from_slice(&buf).unwrap()
+    }
+
+    #[test]
+    fn a_delta_document_labels_every_group() {
+        use crate::duplicates::novelty::Novelty;
+        let doc = labelled_doc(true, &[Novelty::Unchanged, Novelty::Grown { from: 2 }]);
+        let groups = doc["duplicate_groups"].as_array().unwrap();
+        assert_eq!(groups[0]["status"], "unchanged", "{doc}");
+        assert!(groups[0].get("grown_from").is_none(), "{doc}");
+        assert_eq!(groups[1]["status"], "grown", "{doc}");
+        assert_eq!(groups[1]["grown_from"], 2, "{doc}");
+        let new = labelled_doc(true, &[Novelty::New, Novelty::New]);
+        assert_eq!(new["duplicate_groups"][0]["status"], "new", "{new}");
+    }
+
+    #[test]
+    fn a_plain_report_labels_no_group() {
+        use crate::duplicates::novelty::Novelty;
+        let doc = labelled_doc(false, &[Novelty::New, Novelty::Unchanged]);
+        for group in doc["duplicate_groups"].as_array().unwrap() {
+            assert!(group.get("status").is_none(), "{doc}");
+        }
+    }
+
+    #[test]
+    fn statuses_that_do_not_cover_every_group_label_none() {
+        use crate::duplicates::novelty::Novelty;
+        let doc = labelled_doc(true, &[Novelty::New]);
+        for group in doc["duplicate_groups"].as_array().unwrap() {
+            assert!(group.get("status").is_none(), "{doc}");
         }
     }
 

@@ -14,9 +14,10 @@ use cargo_crap::{
     },
     complexity,
     coverage::{self, FileCoverage},
-    delta::{compute_delta, load_baseline_with_weight},
+    delta::{Baseline, compute_delta, load_baseline_with_weight},
     duplicates,
     duplicates::compare::DuplicatePair,
+    duplicates::extract::Location,
     duplicates::triage::provider::{Provider, default_provider},
     duplicates::triage::verdict::Assessment,
     merge::{MissingCoveragePolicy, ScopeDiagnostics, SortOrder, merge, sort_entries},
@@ -899,6 +900,29 @@ impl BaselineFilter {
         self.exclude_set.is_match(rel)
     }
 
+    /// Drop every duplicate group member the current run's duplicate scan
+    /// would not have seen: the exclude globs only, since the scan never
+    /// reads the `--allow` patterns.
+    fn retain_members(
+        &self,
+        groups: &mut [Vec<Location>],
+    ) {
+        for members in groups {
+            members.retain(|m| !self.is_excluded(&m.file));
+        }
+    }
+
+    /// True when the current run would produce `function` in `file`.
+    fn keeps(
+        &self,
+        file: &Path,
+        function: &str,
+    ) -> bool {
+        !self.is_excluded(file)
+            && !self.name_allow.is_match(function)
+            && !path_set_matches_suffix(&self.path_allow, file)
+    }
+
     /// Drop every entry the current run would not have produced. Filtered
     /// entries vanish for delta purposes: they appear in no bucket
     /// (`removed` included) and cannot pair in the name-fallback pass.
@@ -906,11 +930,7 @@ impl BaselineFilter {
         &self,
         entries: &mut Vec<cargo_crap::merge::CrapEntry>,
     ) {
-        entries.retain(|e| {
-            !self.is_excluded(&e.file)
-                && !self.name_allow.is_match(&e.function)
-                && !path_set_matches_suffix(&self.path_allow, &e.file)
-        });
+        entries.retain(|e| self.keeps(&e.file, &e.function));
     }
 }
 
@@ -1315,21 +1335,27 @@ fn load_filtered_baseline(
     members: &[WorkspaceMember],
     member_scope: Option<&MemberScope>,
     try_weight: f64,
-) -> Result<Option<Vec<cargo_crap::merge::CrapEntry>>> {
+) -> Result<Option<Baseline>> {
     let Some(baseline_path) = baseline else {
         return Ok(None);
     };
     let baseline = load_baseline_with_weight(baseline_path)?;
     warn_on_try_weight_mismatch(baseline.try_weight, try_weight);
-    let mut data = baseline.entries;
+    let mut baseline = baseline;
     let roots = if members.is_empty() {
         vec![path.to_path_buf()]
     } else {
         members.iter().map(|m| m.dir.clone()).collect()
     };
-    BaselineFilter::new(excludes, allow_patterns, roots)?.retain(&mut data);
-    apply_member_scope(&mut data, member_scope);
-    Ok(Some(data))
+    let filter = BaselineFilter::new(excludes, allow_patterns, roots)?;
+    filter.retain(&mut baseline.entries);
+    apply_member_scope(&mut baseline.entries, member_scope);
+    // At most one record: `for_each` filters it when the baseline has one.
+    baseline
+        .duplicate_groups
+        .iter_mut()
+        .for_each(|groups| filter_duplicate_record(groups, &filter, member_scope));
+    Ok(Some(baseline))
 }
 
 fn warn_on_try_weight_mismatch(
@@ -1366,8 +1392,31 @@ fn apply_member_scope(
     data: &mut Vec<cargo_crap::merge::CrapEntry>,
     member_scope: Option<&MemberScope>,
 ) {
+    retain_in_scope(data, member_scope, |e| &e.file);
+}
+
+/// Keep the `items` whose file `member_scope` covers, or every item without
+/// a scope.
+fn retain_in_scope<T>(
+    items: &mut Vec<T>,
+    member_scope: Option<&MemberScope>,
+    file: impl Fn(&T) -> &Path,
+) {
     if let Some(scope) = member_scope {
-        data.retain(|e| !scope.is_out_of_scope(&e.file));
+        items.retain(|item| !scope.is_out_of_scope(file(item)));
+    }
+}
+
+/// Narrow a baseline's duplicate record to the members the current run's
+/// duplicate scan would see: its exclude globs and member scope.
+fn filter_duplicate_record(
+    groups: &mut [Vec<Location>],
+    filter: &BaselineFilter,
+    member_scope: Option<&MemberScope>,
+) {
+    filter.retain_members(groups);
+    for members in groups {
+        retain_in_scope(members, member_scope, |m| &m.file);
     }
 }
 
@@ -1492,8 +1541,12 @@ struct DuplicateSection<'a> {
     pairs: Option<Vec<DuplicatePair>>,
     /// The pairs grouped into functions that all resemble each other.
     groups: Option<Vec<duplicates::group::DuplicateGroup>>,
-    /// One assessment per group, in the groups' order.
-    triage: Option<Vec<Assessment>>,
+    /// The groups measured against the baseline's duplicate record, on a
+    /// delta run whose baseline has one.
+    novelty: Option<duplicates::novelty::Comparison>,
+    /// One verdict per group, in the groups' order, `None` for a group
+    /// nobody asked about.
+    triage: Option<Vec<Option<Assessment>>>,
     /// The display name of the provider asked, named when triage answered.
     provider: &'static str,
     /// The model asked.
@@ -1502,42 +1555,111 @@ struct DuplicateSection<'a> {
 
 impl DuplicateSection<'_> {
     /// Who answered the triage: the provider and the model asked, when
-    /// triage produced assessments.
+    /// triage gave at least one verdict.
     fn triaged_by(&self) -> Option<TriagedBy<'_>> {
-        self.triage.as_ref().map(|_| TriagedBy {
+        let answered = |t: &&Vec<Option<Assessment>>| t.iter().any(Option::is_some);
+        self.triage.as_ref().filter(answered).map(|_| TriagedBy {
             provider: self.provider,
             model: self.model,
         })
     }
 }
 
-/// Find the duplicate pairs and group them, then triage each group's most
-/// similar pair when configured to. Triage only ever sees groups that will
-/// be reported, so a format that cannot carry duplicates never triggers a
+/// Find the duplicate pairs and group them, measure the groups against the
+/// baseline's duplicate record when there is one, then triage each group's
+/// most similar pair when configured to: every group, or on a delta run only
+/// the new and grown ones. Triage only ever sees groups that will be
+/// reported, so a format that cannot carry duplicates never triggers a
 /// request.
 fn duplicate_section<'a>(
     settings: &'a DupSettings,
     roots: &[ScanRoot],
     format: Format,
     target: Option<&Path>,
+    baseline: Option<&Baseline>,
 ) -> Result<DuplicateSection<'a>> {
     let pairs = duplicate_pairs(settings, roots, format)?;
     let groups = pairs
         .as_deref()
         .map(|pairs| duplicates::group::group_pairs(pairs, settings.threshold));
-    // One request per group, about its most similar pair.
+    warn_on_missing_record(groups.as_deref(), baseline);
+    let novelty = novelty_against(groups.as_deref(), baseline);
+    // One request per group asked about, about its most similar pair.
     let triage = groups.as_deref().and_then(|groups| {
-        let representatives: Vec<DuplicatePair> =
-            groups.iter().map(|g| g.representative.clone()).collect();
+        let asked = asked(novelty.as_ref(), groups.len());
+        let representatives: Vec<DuplicatePair> = asked
+            .iter()
+            .map(|&n| groups[n].representative.clone())
+            .collect();
         triage_assessments(settings, &representatives, target)
+            .map(|verdicts| spread(&asked, verdicts, groups.len()))
     });
     Ok(DuplicateSection {
         pairs,
         groups,
+        novelty,
         triage,
         provider: settings.triage_provider.display_name(),
         model: &settings.triage_model,
     })
+}
+
+/// The groups triage asks about, by index: every group, or on a delta run
+/// with a duplicate record the ones it reports.
+fn asked(
+    novelty: Option<&duplicates::novelty::Comparison>,
+    groups: usize,
+) -> Vec<usize> {
+    novelty.map_or_else(|| (0..groups).collect(), |c| c.reported().collect())
+}
+
+/// The `verdicts` for the `asked` groups, each put back at its group's
+/// index among `groups`, with `None` for the groups nobody asked about.
+fn spread(
+    asked: &[usize],
+    verdicts: Vec<Assessment>,
+    groups: usize,
+) -> Vec<Option<Assessment>> {
+    debug_assert_eq!(asked.len(), verdicts.len(), "one verdict per question");
+    let mut spread = vec![None; groups];
+    for (&n, verdict) in asked.iter().zip(verdicts) {
+        spread[n] = Some(verdict);
+    }
+    spread
+}
+
+/// The warning for a delta run that found duplicate groups against a
+/// baseline recorded without `--duplicates`, which leaves nothing to tell
+/// the new groups from the old.
+fn missing_record_warning(
+    groups: Option<&[duplicates::group::DuplicateGroup]>,
+    baseline: Option<&Baseline>,
+) -> Option<&'static str> {
+    let found = groups.is_some_and(|g| !g.is_empty());
+    (found && baseline.is_some_and(|b| b.duplicate_groups.is_none())).then_some(
+        "warning: the baseline has no duplicate record, so the new duplicates cannot be \
+         told from the old. Record the baseline with --duplicates to tell them apart.",
+    )
+}
+
+/// Print [`missing_record_warning`] when it applies.
+fn warn_on_missing_record(
+    groups: Option<&[duplicates::group::DuplicateGroup]>,
+    baseline: Option<&Baseline>,
+) {
+    if let Some(warning) = missing_record_warning(groups, baseline) {
+        eprintln!("{warning}");
+    }
+}
+
+/// The current groups measured against the baseline's duplicate record,
+/// when the run found groups and the baseline recorded some.
+fn novelty_against(
+    groups: Option<&[duplicates::group::DuplicateGroup]>,
+    baseline: Option<&Baseline>,
+) -> Option<duplicates::novelty::Comparison> {
+    let recorded = baseline?.duplicate_groups.as_deref()?;
+    Some(duplicates::novelty::compare(groups?, recorded))
 }
 
 /// Ask the model about `pairs` when triage is enabled, and hold each verdict
@@ -1849,7 +1971,8 @@ fn run() -> Result<ExitCode> {
     // --- Render ---
     let mut out_box = prepare_output(cli.output.as_ref())?;
     let links = resolve_source_links(cli.repo_url, cli.commit_ref, &knobs.cwd);
-    let dups = duplicate_section(&dup, &roots, cli.format.into(), target.as_deref())?;
+    let baseline = baseline_data.as_ref();
+    let dups = duplicate_section(&dup, &roots, cli.format.into(), target.as_deref(), baseline)?;
     let opts = RenderOpts {
         render: RenderOptions {
             threshold,
@@ -1867,6 +1990,7 @@ fn run() -> Result<ExitCode> {
             groups: dups.groups.as_deref(),
             triage: dups.triage.as_deref(),
             triaged_by: dups.triaged_by(),
+            novelty: dups.novelty.as_ref(),
         },
         epsilon,
         summary: cli.summary,
@@ -1875,7 +1999,7 @@ fn run() -> Result<ExitCode> {
     let (has_crappy, has_regression) = do_render(
         sliced_rows.as_deref().unwrap_or(&entries),
         &entries,
-        baseline_data.as_deref(),
+        baseline.map(|b| b.entries.as_slice()),
         &opts,
         out_box.as_mut(),
     )?;
@@ -2687,9 +2811,151 @@ mod tests {
     }
 
     #[test]
+    fn baseline_filter_drops_duplicate_members_only_by_the_exclude_globs() {
+        // `--allow` hides CRAP rows, and the duplicate scan never reads it:
+        // a member it names is still in the current run's groups.
+        let filter = BaselineFilter::new(
+            &strs(&["tests/**"]),
+            &strs(&["skip_me", "gen/**"]),
+            vec![PathBuf::from(".")],
+        )
+        .unwrap();
+        let at = |file: &str, name: &str| Location {
+            file: PathBuf::from(file),
+            start_line: 1,
+            end_line: 9,
+            name: name.to_string(),
+        };
+        let kept = vec![
+            at("src/a.rs", "g"),
+            at("src/b.rs", "skip_me"),
+            at("gen/c.rs", "h"),
+        ];
+        let mut groups = vec![
+            vec![at("tests/it.rs", "helper"), at("src/a.rs", "g")],
+            kept.clone(),
+        ];
+        filter.retain_members(&mut groups);
+        assert_eq!(groups, vec![vec![at("src/a.rs", "g")], kept]);
+    }
+
+    #[test]
+    fn a_duplicate_record_is_narrowed_to_the_selected_members() {
+        let at = |file: &str, name: &str| Location {
+            file: PathBuf::from(file),
+            start_line: 1,
+            end_line: 9,
+            name: name.to_string(),
+        };
+        let filter = BaselineFilter::new(&[], &[], vec![PathBuf::from("/ws")]).unwrap();
+        let mut groups = vec![
+            vec![
+                at("/ws/crates/alpha/src/lib.rs", "f"),
+                at("/ws/crates/beta/src/lib.rs", "g"),
+            ],
+            vec![
+                at("/ws/crates/alpha/src/a.rs", "h"),
+                at("/ws/crates/alpha/src/b.rs", "k"),
+            ],
+        ];
+        filter_duplicate_record(&mut groups, &filter, Some(&root_layout_scope()));
+        assert_eq!(
+            groups,
+            vec![
+                vec![at("/ws/crates/alpha/src/lib.rs", "f")],
+                vec![
+                    at("/ws/crates/alpha/src/a.rs", "h"),
+                    at("/ws/crates/alpha/src/b.rs", "k"),
+                ],
+            ]
+        );
+    }
+
+    #[test]
+    fn nobody_is_named_when_triage_gave_no_verdict() {
+        let section = |triage| DuplicateSection {
+            pairs: None,
+            groups: None,
+            novelty: None,
+            triage,
+            provider: "OpenAI API",
+            model: "gpt-x",
+        };
+        assert!(section(Some(vec![None, None])).triaged_by().is_none());
+        assert!(section(None).triaged_by().is_none());
+        let answered = section(Some(vec![
+            None,
+            Some(Assessment::Uncertain { confidence: 0.4 }),
+        ]));
+        assert!(answered.triaged_by().is_some());
+    }
+
+    #[test]
+    fn only_a_baseline_without_a_duplicate_record_is_warned_about() {
+        let baseline = |duplicate_groups| Baseline {
+            entries: vec![],
+            try_weight: cargo_crap::config::DEFAULT_TRY_WEIGHT,
+            duplicate_groups,
+        };
+        let at = |name: &str| duplicates::extract::Location {
+            file: PathBuf::from("src/a.rs"),
+            start_line: 1,
+            end_line: 9,
+            name: name.to_string(),
+        };
+        let found = [duplicates::group::DuplicateGroup::of_pair(&DuplicatePair {
+            first: at("f"),
+            second: at("g"),
+            score: 0.9,
+        })];
+        let warning =
+            missing_record_warning(Some(&found), Some(&baseline(None))).expect("a warning");
+        assert!(warning.contains("no duplicate record"), "{warning}");
+        assert!(warning.contains("--duplicates"), "{warning}");
+        assert!(!warning.contains(';'), "{warning}");
+        let record = baseline(Some(vec![]));
+        assert_eq!(missing_record_warning(Some(&found), Some(&record)), None);
+        assert_eq!(missing_record_warning(Some(&found), None), None);
+        assert_eq!(
+            missing_record_warning(Some(&[]), Some(&baseline(None))),
+            None
+        );
+        assert_eq!(missing_record_warning(None, Some(&baseline(None))), None);
+    }
+
+    #[test]
+    fn triage_asks_about_every_group_without_a_record() {
+        assert_eq!(asked(None, 3), [0, 1, 2]);
+    }
+
+    #[test]
+    fn triage_asks_only_about_new_and_grown_groups() {
+        use duplicates::novelty::{Comparison, Novelty};
+        let comparison = Comparison {
+            novelty: vec![
+                Novelty::Unchanged,
+                Novelty::New,
+                Novelty::Grown { from: 2 },
+                Novelty::Unchanged,
+            ],
+            resolved: 0,
+        };
+        assert_eq!(asked(Some(&comparison), 4), [1, 2]);
+    }
+
+    #[test]
+    fn verdicts_go_back_to_the_groups_that_were_asked_about() {
+        let verdict = |confidence| Assessment::Uncertain { confidence };
+        assert_eq!(
+            spread(&[1, 2], vec![verdict(0.1), verdict(0.2)], 4),
+            [None, Some(verdict(0.1)), Some(verdict(0.2)), None]
+        );
+    }
+
+    #[test]
     fn baseline_filter_normalizes_backslash_paths() {
         // Baseline written on Windows: separators must be normalized before
-        // glob matching, as in delta's path_key.
+        // glob matching, as in merge's path_key.
         let filter =
             BaselineFilter::new(&strs(&["tests/**"]), &[], vec![PathBuf::from(".")]).unwrap();
         let mut entries = vec![baseline_entry("tests\\integration.rs", "test_helper")];

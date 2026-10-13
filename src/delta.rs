@@ -13,7 +13,8 @@
 //! cargo crap --lcov lcov.info --baseline baseline.json --fail-regression
 //! ```
 
-use crate::merge::{CrapEntry, SortOrder};
+use crate::duplicates::extract::Location;
+use crate::merge::{CrapEntry, SortOrder, path_key};
 use anyhow::{Context, Result};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
@@ -190,6 +191,10 @@ pub struct Baseline {
     /// The envelope's `try_weight`; a baseline without the key was recorded
     /// at [`DEFAULT_TRY_WEIGHT`](crate::config::DEFAULT_TRY_WEIGHT).
     pub try_weight: f64,
+    /// Each recorded duplicate group's members, when the baseline ran with
+    /// `--duplicates`: an empty list when it found none, `None` when it
+    /// did not look.
+    pub duplicate_groups: Option<Vec<Vec<Location>>>,
 }
 
 /// Load a JSON baseline produced by a previous `cargo crap --format json` run.
@@ -213,11 +218,13 @@ pub fn load_baseline_with_weight(path: &Path) -> Result<Baseline> {
         try_weight: envelope
             .try_weight
             .unwrap_or(crate::config::DEFAULT_TRY_WEIGHT),
+        duplicate_groups: envelope.duplicate_groups.map(|groups| {
+            groups
+                .into_iter()
+                .map(|g| g.members.into_iter().map(Location::from).collect())
+                .collect()
+        }),
     })
-}
-
-fn path_key(p: &Path) -> String {
-    p.to_string_lossy().replace('\\', "/")
 }
 
 /// File-order key for a current entry: `(file, function, line)` ascending,
@@ -697,7 +704,7 @@ mod tests {
         // side gets paired by name during the second-pass matcher. Same
         // CC + coverage + crap → status `Moved`, not `New`/`Removed`.
         //
-        // Also kills: `path_key -> String` collapsing to a constant.
+        // Also kills: `merge::path_key -> String` collapsing to a constant.
         // Under that mutation, pass 1 would falsely match these as
         // Unchanged with previous_file = None — distinguishable from the
         // correct (Moved, Some(src/main.rs)) outcome.
@@ -857,6 +864,73 @@ mod tests {
         assert_eq!(baseline.entries.len(), 1);
         // The entries-only loader reads the same file unchanged.
         assert_eq!(load_baseline(&path).expect("parse").len(), 1);
+    }
+
+    #[test]
+    fn a_baseline_keeps_its_duplicate_record() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("dups.json");
+        std::fs::write(
+            &path,
+            r#"{"version":"0.8.0","entries":[],"duplicate_groups":[{"members":[
+                {"file":"src/a.rs","function":"f","start_line":1,"end_line":9},
+                {"file":"src/b.rs","function":"g","start_line":3,"end_line":11}],"score":0.9}]}"#,
+        )
+        .expect("write");
+        let groups = load_baseline_with_weight(&path)
+            .expect("parse")
+            .duplicate_groups
+            .expect("a record");
+        let at = |file: &str, name: &str, start_line, end_line| Location {
+            file: PathBuf::from(file),
+            start_line,
+            end_line,
+            name: name.to_string(),
+        };
+        assert_eq!(
+            groups,
+            vec![vec![at("src/a.rs", "f", 1, 9), at("src/b.rs", "g", 3, 11)]]
+        );
+    }
+
+    #[test]
+    fn a_delta_report_reused_as_a_baseline_still_loads() {
+        // Its groups carry delta-only labels, one from a later release.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("delta.json");
+        std::fs::write(
+            &path,
+            r#"{"version":"0.9.0","entries":[],"duplicate_groups":[{"members":[
+                {"file":"src/a.rs","function":"f","start_line":1,"end_line":9},
+                {"file":"src/b.rs","function":"g","start_line":3,"end_line":11}],
+                "score":0.9,"status":"shrunk","grown_from":2}]}"#,
+        )
+        .expect("write");
+        let baseline = load_baseline_with_weight(&path).expect("a lenient read");
+        assert_eq!(baseline.duplicate_groups.map(|g| g.len()), Some(1));
+    }
+
+    #[test]
+    fn an_empty_duplicate_record_is_a_record() {
+        // `--duplicates` ran and found nothing: every group now is new.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("none.json");
+        std::fs::write(
+            &path,
+            r#"{"version":"0.8.0","entries":[],"duplicate_groups":[]}"#,
+        )
+        .expect("write");
+        let baseline = load_baseline_with_weight(&path).expect("parse");
+        assert_eq!(baseline.duplicate_groups, Some(vec![]));
+    }
+
+    #[test]
+    fn a_baseline_recorded_without_duplicates_has_no_record() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("plain.json");
+        std::fs::write(&path, r#"{"version":"0.8.0","entries":[]}"#).expect("write");
+        let baseline = load_baseline_with_weight(&path).expect("parse");
+        assert_eq!(baseline.duplicate_groups, None);
     }
 
     // ─── Move-aware delta detection (spec 13) ────────────────────────────

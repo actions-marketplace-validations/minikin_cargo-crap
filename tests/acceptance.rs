@@ -1801,9 +1801,15 @@ fn the_json_envelope_carries_the_verdict_beside_the_pair() {
     assert_eq!(stripped, plain["duplicates"]);
     assert!(plain["duplicates"][0].get("triage").is_none());
 
-    // The delta envelope carries it the same way
+    // The delta envelope carries it the same way. The baseline keeps no
+    // duplicate record, so every group is triaged again rather than only
+    // the ones it lacks.
     let baseline = dir.path().join("baseline.json");
-    fs::write(&baseline, plain.to_string()).expect("write baseline");
+    let mut entries_only = plain.clone();
+    for key in ["duplicates", "duplicate_groups"] {
+        entries_only.as_object_mut().expect("an object").remove(key);
+    }
+    fs::write(&baseline, entries_only.to_string()).expect("write baseline");
     let delta = run_with_config(
         dir.path(),
         TRIAGE_ON,
@@ -5517,7 +5523,8 @@ fn words_copy(name: &str) -> String {
 }
 
 /// The section of a markdown or pr-comment report from its duplicate
-/// heading (`## N duplicate candidate(s)`) on, and the body rows of the
+/// heading (`## N duplicate candidate(s)`, or `## N new duplicate
+/// candidate(s)` on a delta run) on, and the body rows of the
 /// first table under it, up to the first line that is not a row.
 fn duplicate_rows(stdout: &str) -> (&str, Vec<&str>) {
     let at = stdout
@@ -5528,7 +5535,9 @@ fn duplicate_rows(stdout: &str) -> (&str, Vec<&str>) {
             line.split_once(' ')
                 .and_then(|(_, rest)| rest.split_once(' '))
                 .is_some_and(|(count, rest)| {
-                    count.parse::<usize>().is_ok() && rest.starts_with("duplicate candidate")
+                    count.parse::<usize>().is_ok()
+                        && (rest.starts_with("duplicate candidate")
+                            || rest.starts_with("new duplicate candidate"))
                 })
         })
         .unwrap_or_else(|| panic!("a duplicate heading: {stdout}"));
@@ -5703,4 +5712,643 @@ fn a_triaged_summary_line_counts_groups() {
     // And the summary line counts groups
     assert!(section.contains("\n🔴 26 should be one\n"), "{section}");
     assert_eq!(rows.len(), 25, "{section}");
+}
+
+// ── Spec 37: new duplicates in a delta report ─────────────────────────────
+
+/// A filtering loop named `name`, unlike [`tally_copy`] and [`words_copy`].
+fn filter_copy(name: &str) -> String {
+    format!(
+        "fn {name}(xs: &[i32]) -> Vec<i32> {{
+    let mut ys = Vec::new();
+    for x in xs {{
+        if x % 2 == 1 {{
+            ys.push(x + 1);
+        }}
+    }}
+    ys
+}}
+"
+    )
+}
+
+/// A sum over a range by cases named `name`.
+fn tally_copy(name: &str) -> String {
+    format!(
+        "fn {name}(a: i32, b: i32) -> i32 {{
+    let (lo, hi) = if a < b {{ (a, b) }} else {{ (b, a) }};
+    let mut acc = 0;
+    for v in lo..hi {{
+        acc += match v % 4 {{
+            0 => v * 2,
+            1 => -v,
+            _ => 1,
+        }};
+    }}
+    acc.max(0)
+}}
+"
+    )
+}
+
+/// [`duplicates_run`] from inside `dir`, so a `.cargo-crap.toml` there is
+/// the run's config.
+fn run_inside(
+    dir: &Path,
+    format: &str,
+    extra: &[&str],
+) -> std::process::Output {
+    crap()
+        .current_dir(dir)
+        .args(["--path", dir.to_str().expect("utf-8"), "--format", format])
+        .args(extra)
+        .output()
+        .expect("the binary runs")
+}
+
+/// Record a `--duplicates` JSON baseline of `dir` as `base.json` in `into`.
+fn record_duplicates(
+    dir: &Path,
+    into: &Path,
+) -> PathBuf {
+    let baseline = into.join("base.json");
+    let out = run_inside(
+        dir,
+        "json",
+        &[
+            "--duplicates",
+            "--output",
+            baseline.to_str().expect("utf-8"),
+        ],
+    );
+    assert!(out.status.success(), "the baseline is written: {out:?}");
+    baseline
+}
+
+/// `cargo crap --duplicates --baseline <baseline> --format <format>` over
+/// `dir`, as text.
+fn delta_duplicates(
+    dir: &Path,
+    baseline: &Path,
+    format: &str,
+) -> String {
+    let out = run_inside(
+        dir,
+        format,
+        &[
+            "--duplicates",
+            "--baseline",
+            baseline.to_str().expect("utf-8"),
+        ],
+    );
+    assert!(out.status.success(), "the run succeeds: {out:?}");
+    String::from_utf8(out.stdout).expect("utf-8")
+}
+
+#[test]
+fn a_copy_the_pull_request_adds_is_the_only_one_shown() {
+    // Given a baseline recorded with `--format json --duplicates` holding two
+    // duplicate groups
+    let (dir, store) = (
+        TempDir::new().expect("temp dir"),
+        TempDir::new().expect("temp dir"),
+    );
+    let two_groups = [
+        filter_copy("one"),
+        filter_copy("two"),
+        tally_copy("three"),
+        tally_copy("four"),
+    ]
+    .concat();
+    write(dir.path(), "a.rs", &two_groups);
+    let baseline = record_duplicates(dir.path(), store.path());
+    // And the current tree has those two groups and one new pair of look-alikes
+    write(
+        dir.path(),
+        "b.rs",
+        &[words_copy("five"), words_copy("six")].concat(),
+    );
+    // When I run `cargo crap --duplicates --baseline base.json --format pr-comment`
+    let stdout = delta_duplicates(dir.path(), &baseline, "pr-comment");
+    let (section, rows) = duplicate_rows(&stdout);
+    // Then the section is headed "## 1 new duplicate candidate"
+    assert!(
+        section.starts_with("## 1 new duplicate candidate\n"),
+        "{section}"
+    );
+    // And its table has one row, for the new pair
+    assert_eq!(rows.len(), 1, "{section}");
+    assert!(
+        rows[0].contains("five") && rows[0].contains("six"),
+        "{section}"
+    );
+    // And a line under the table reads "2 existing candidates unchanged."
+    assert!(
+        section.contains("\n2 existing candidates unchanged.\n"),
+        "{section}"
+    );
+}
+
+#[test]
+fn shifted_lines_do_not_make_a_group_new() {
+    // Given a baseline with one duplicate group
+    let (dir, store) = (
+        TempDir::new().expect("temp dir"),
+        TempDir::new().expect("temp dir"),
+    );
+    write(
+        dir.path(),
+        "a.rs",
+        &[filter_copy("one"), filter_copy("two")].concat(),
+    );
+    let baseline = record_duplicates(dir.path(), store.path());
+    // And the current tree inserts lines above every member, changing their
+    // start and end lines
+    let shifted = format!(
+        "// a note\n// another\n\n{}\n\n\n{}",
+        filter_copy("one"),
+        filter_copy("two")
+    );
+    write(dir.path(), "a.rs", &shifted);
+    // When I run `cargo crap --duplicates --baseline base.json --format pr-comment`
+    let stdout = delta_duplicates(dir.path(), &baseline, "pr-comment");
+    // Then no duplicate section is printed
+    assert!(!stdout.contains("duplicate candidate"), "{stdout}");
+}
+
+#[test]
+fn a_moved_function_keeps_its_group() {
+    // Given a baseline with a pair of look-alikes in `src/a.rs` and `src/b.rs`
+    let (dir, store) = (
+        TempDir::new().expect("temp dir"),
+        TempDir::new().expect("temp dir"),
+    );
+    write(dir.path(), "a.rs", &filter_copy("one"));
+    write(dir.path(), "b.rs", &filter_copy("two"));
+    let baseline = record_duplicates(dir.path(), store.path());
+    // And the current tree moves the function in `src/b.rs` to `src/c.rs`,
+    // unchanged
+    fs::remove_file(dir.path().join("b.rs")).expect("remove b.rs");
+    write(dir.path(), "c.rs", &filter_copy("two"));
+    // When I run `cargo crap --duplicates --baseline base.json --format markdown`
+    let stdout = delta_duplicates(dir.path(), &baseline, "markdown");
+    // Then the section reports no new duplicate candidates
+    assert!(
+        stdout.contains("\n## No new duplicate candidates\n"),
+        "{stdout}"
+    );
+    // And the line under it reads "1 existing candidate unchanged."
+    assert!(
+        stdout.contains("\n1 existing candidate unchanged.\n"),
+        "{stdout}"
+    );
+}
+
+/// Two look-alike `fmt` methods in one file, each in its own impl, with
+/// `above` before each.
+fn twin_fmts(above: &str) -> String {
+    let method = |ty: &str| {
+        format!(
+            "struct {ty};\nimpl {ty} {{\n{above}    fn fmt(&self, xs: &[i32]) -> Vec<i32> {{
+        let mut ys = Vec::new();
+        for x in xs {{
+            if x % 2 == 1 {{
+                ys.push(x + 1);
+            }}
+        }}
+        ys
+    }}
+}}
+"
+        )
+    };
+    [method("A"), method("B")].concat()
+}
+
+#[test]
+fn same_named_members_keep_their_group_when_lines_shift() {
+    // Given a baseline with a pair of look-alike `fmt` methods, both in
+    // `src/lib.rs`
+    let (dir, store) = (
+        TempDir::new().expect("temp dir"),
+        TempDir::new().expect("temp dir"),
+    );
+    write(dir.path(), "lib.rs", &twin_fmts(""));
+    let baseline = record_duplicates(dir.path(), store.path());
+    // And the current tree inserts lines above both
+    write(dir.path(), "lib.rs", &twin_fmts("    // a note\n\n"));
+    // When I run `cargo crap --duplicates --baseline base.json --format markdown`
+    let stdout = delta_duplicates(dir.path(), &baseline, "markdown");
+    // Then the section reports no new duplicate candidates
+    assert!(
+        stdout.contains("\n## No new duplicate candidates\n"),
+        "{stdout}"
+    );
+    // And the line under it reads "1 existing candidate unchanged."
+    assert!(
+        stdout.contains("\n1 existing candidate unchanged.\n"),
+        "{stdout}"
+    );
+}
+
+/// A pair of identical functions for each shape in `range`, every shape a
+/// different number of trailing pushes, so only a config that pairs
+/// identical shapes alone keeps the pairs apart.
+fn shaped_pairs(range: std::ops::Range<usize>) -> String {
+    range
+        .flat_map(|k| {
+            ["a", "b"].map(move |side| {
+                let pushes = "    ys.push(0);\n".repeat(k + 1);
+                format!(
+                    "fn p{k:02}_{side}(xs: &[i32]) -> Vec<i32> {{
+    let mut ys = Vec::new();
+    for x in xs {{
+        if x % 2 == 1 {{
+            ys.push(x + 1);
+        }}
+    }}
+{pushes}    ys
+}}
+"
+                )
+            })
+        })
+        .collect()
+}
+
+#[test]
+fn the_cap_counts_the_groups_shown() {
+    // Given a baseline with thirty duplicate groups that are still present
+    let (dir, store) = (
+        TempDir::new().expect("temp dir"),
+        TempDir::new().expect("temp dir"),
+    );
+    write(
+        dir.path(),
+        ".cargo-crap.toml",
+        "[duplicates]\nenabled = true\nthreshold = 1.0\n",
+    );
+    write(dir.path(), "pairs.rs", &shaped_pairs(0..30));
+    let baseline = record_duplicates(dir.path(), store.path());
+    // And the current tree adds two new pairs
+    write(dir.path(), "more.rs", &shaped_pairs(30..32));
+    // When I run `cargo crap --duplicates --baseline base.json --format pr-comment`
+    let stdout = delta_duplicates(dir.path(), &baseline, "pr-comment");
+    let (section, rows) = duplicate_rows(&stdout);
+    // Then the table has two rows and no truncation footer
+    assert_eq!(rows.len(), 2, "{section}");
+    assert!(!section.contains("more, see CI artifact"), "{section}");
+    assert!(
+        section.contains("\n30 existing candidates unchanged.\n"),
+        "{section}"
+    );
+}
+
+#[test]
+fn a_copy_added_to_an_existing_group_shows_the_group_as_grown() {
+    // Given a baseline whose only group has three members
+    let (dir, store) = (
+        TempDir::new().expect("temp dir"),
+        TempDir::new().expect("temp dir"),
+    );
+    let three = [filter_copy("one"), filter_copy("two"), filter_copy("three")].concat();
+    write(dir.path(), "a.rs", &three);
+    let baseline = record_duplicates(dir.path(), store.path());
+    // And the current tree adds a fourth copy of that function
+    write(dir.path(), "b.rs", &filter_copy("four"));
+    // When I run `cargo crap --duplicates --baseline base.json --format pr-comment`
+    let stdout = delta_duplicates(dir.path(), &baseline, "pr-comment");
+    let (section, rows) = duplicate_rows(&stdout);
+    // Then the section is headed "## 1 new duplicate candidate"
+    assert!(
+        section.starts_with("## 1 new duplicate candidate\n"),
+        "{section}"
+    );
+    // And its one row lists all four members
+    assert_eq!(rows.len(), 1, "{section}");
+    for name in ["`one`", "`two`", "`three`", "`four`"] {
+        assert!(rows[0].contains(name), "{name} in {section}");
+    }
+    // And the row says the group grew from 3 functions
+    assert!(rows[0].contains("grew from 3"), "{section}");
+}
+
+#[test]
+fn a_pull_request_that_removes_a_copy_is_credited() {
+    // Given a baseline with two duplicate groups
+    let (dir, store) = (
+        TempDir::new().expect("temp dir"),
+        TempDir::new().expect("temp dir"),
+    );
+    write(
+        dir.path(),
+        "a.rs",
+        &[filter_copy("one"), filter_copy("two")].concat(),
+    );
+    write(
+        dir.path(),
+        "b.rs",
+        &[tally_copy("three"), tally_copy("four")].concat(),
+    );
+    let baseline = record_duplicates(dir.path(), store.path());
+    // And the current tree deletes one member of a pair, so that group is gone
+    write(dir.path(), "b.rs", &tally_copy("three"));
+    // When I run `cargo crap --duplicates --baseline base.json --format pr-comment`
+    let stdout = delta_duplicates(dir.path(), &baseline, "pr-comment");
+    // Then the section is headed "## No new duplicate candidates"
+    assert!(
+        stdout.contains("\n## No new duplicate candidates\n"),
+        "{stdout}"
+    );
+    // And the line under it reads "1 existing candidate unchanged, 1 resolved."
+    assert!(
+        stdout.contains("\n1 existing candidate unchanged, 1 resolved.\n"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn nothing_new_prints_nothing_in_the_pr_comment() {
+    // Given a baseline whose duplicate groups are all still present, unchanged
+    // And none was resolved
+    let (dir, store) = (
+        TempDir::new().expect("temp dir"),
+        TempDir::new().expect("temp dir"),
+    );
+    write(
+        dir.path(),
+        "a.rs",
+        &[filter_copy("one"), filter_copy("two")].concat(),
+    );
+    let baseline = record_duplicates(dir.path(), store.path());
+    // When I run `cargo crap --duplicates --baseline base.json --format pr-comment`
+    let stdout = delta_duplicates(dir.path(), &baseline, "pr-comment");
+    // Then the comment has no duplicate section
+    assert!(!stdout.contains("duplicate candidate"), "{stdout}");
+    // When I run the same with `--format markdown`
+    let stdout = delta_duplicates(dir.path(), &baseline, "markdown");
+    // Then the section is headed "## No new duplicate candidates" and has the
+    // count line
+    assert!(
+        stdout.contains("\n## No new duplicate candidates\n\n1 existing candidate unchanged.\n"),
+        "{stdout}"
+    );
+}
+
+#[cfg(feature = "triage")]
+#[test]
+fn triage_asks_only_about_new_and_grown_groups() {
+    use support::api_stub::{ApiStub, Reply};
+    // Given triage is enabled
+    // And a baseline with two duplicate groups that are still present
+    let (dir, store) = (
+        TempDir::new().expect("temp dir"),
+        TempDir::new().expect("temp dir"),
+    );
+    let two_groups = [
+        filter_copy("one"),
+        filter_copy("two"),
+        tally_copy("three"),
+        tally_copy("four"),
+    ]
+    .concat();
+    write(dir.path(), "a.rs", &two_groups);
+    let baseline = record_duplicates(dir.path(), store.path());
+    // And the current tree adds one new pair
+    write(
+        dir.path(),
+        "b.rs",
+        &[words_copy("five"), words_copy("six")].concat(),
+    );
+    let stub = ApiStub::scripted(vec![Reply::json(&triage_answer_worth(
+        "same_logic",
+        0.9,
+        3.0,
+    ))]);
+    // When I run `cargo crap --duplicates --baseline base.json --format pr-comment`
+    let out = run_with_config(
+        dir.path(),
+        TRIAGE_ON,
+        &stub,
+        &[
+            "--baseline",
+            baseline.to_str().expect("utf-8"),
+            "--format",
+            "pr-comment",
+        ],
+    );
+    let stdout = String::from_utf8(out.stdout).expect("utf-8");
+    let (section, rows) = duplicate_rows(&stdout);
+    // Then exactly one triage request is made
+    assert_eq!(stub.request_count(), 1, "{section}");
+    // And the new pair's row carries its verdict
+    assert_eq!(rows.len(), 1, "{section}");
+    assert!(
+        rows[0].contains("five") && rows[0].starts_with("| 🔴 |"),
+        "{section}"
+    );
+    // And in delta JSON only the new pair's group has a verdict, from the
+    // cache this time
+    let out = run_with_config(
+        dir.path(),
+        TRIAGE_ON,
+        &stub,
+        &[
+            "--baseline",
+            baseline.to_str().expect("utf-8"),
+            "--format",
+            "json",
+        ],
+    );
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).expect("one JSON document");
+    assert_eq!(stub.request_count(), 1, "the verdict comes from the cache");
+    for group in doc["duplicate_groups"].as_array().expect("groups") {
+        let new = group["members"][0]["function"] == "five";
+        assert_eq!(group.get("triage").is_some(), new, "{group}");
+    }
+}
+
+#[cfg(feature = "triage")]
+#[test]
+fn the_human_section_lists_every_group() {
+    use support::api_stub::{ApiStub, Reply};
+    // Given a baseline with one duplicate group that is still present
+    let (dir, store) = (
+        TempDir::new().expect("temp dir"),
+        TempDir::new().expect("temp dir"),
+    );
+    write(
+        dir.path(),
+        "a.rs",
+        &[filter_copy("one"), filter_copy("two")].concat(),
+    );
+    let baseline = record_duplicates(dir.path(), store.path());
+    // And the current tree adds one new pair
+    write(
+        dir.path(),
+        "b.rs",
+        &[words_copy("five"), words_copy("six")].concat(),
+    );
+    let stub = ApiStub::scripted(vec![Reply::json(&triage_answer_worth(
+        "same_logic",
+        0.9,
+        3.0,
+    ))]);
+    // When I run `cargo crap --duplicates --baseline base.json`
+    let out = run_with_config(
+        dir.path(),
+        TRIAGE_ON,
+        &stub,
+        &["--baseline", baseline.to_str().expect("utf-8")],
+    );
+    let stdout = String::from_utf8(out.stdout).expect("utf-8");
+    let section = &stdout[stdout.find("2 duplicate candidates:").expect("both groups")..];
+    // Then the human duplicate section lists both groups
+    let blocks: Vec<&str> = section.split("DUPLICATE").skip(1).collect();
+    assert_eq!(blocks.len(), 2, "{section}");
+    let block = |name: &str| {
+        *blocks
+            .iter()
+            .find(|b| b.contains(&format!(" {name}\n")))
+            .unwrap_or_else(|| panic!("{name} in {section}"))
+    };
+    // And with triage on, only the new pair carries a verdict
+    assert!(block("five").contains("triage:"), "{section}");
+    assert!(!block("one").contains("triage:"), "{section}");
+}
+
+#[test]
+fn delta_json_keeps_every_group_and_labels_it() {
+    // Given a baseline with two duplicate groups
+    let (dir, store) = (
+        TempDir::new().expect("temp dir"),
+        TempDir::new().expect("temp dir"),
+    );
+    write(
+        dir.path(),
+        "a.rs",
+        &[filter_copy("one"), filter_copy("two")].concat(),
+    );
+    write(
+        dir.path(),
+        "b.rs",
+        &[tally_copy("three"), tally_copy("four")].concat(),
+    );
+    let baseline = record_duplicates(dir.path(), store.path());
+    // And the current tree keeps one, adds a member to the other, and adds a
+    // new pair
+    write(dir.path(), "c.rs", &tally_copy("five"));
+    write(
+        dir.path(),
+        "d.rs",
+        &[words_copy("six"), words_copy("seven")].concat(),
+    );
+    // When I run `cargo crap --duplicates --baseline base.json --format json`
+    let stdout = delta_duplicates(dir.path(), &baseline, "json");
+    let doc: serde_json::Value = serde_json::from_str(&stdout).expect("one JSON document");
+    // Then `duplicate_groups` has three entries
+    let groups = doc["duplicate_groups"].as_array().expect("groups");
+    assert_eq!(groups.len(), 3, "{doc:#}");
+    // And their `status` fields are "unchanged", "grown" and "new"
+    let status_of = |name: &str| {
+        groups
+            .iter()
+            .find(|g| {
+                g["members"]
+                    .as_array()
+                    .expect("members")
+                    .iter()
+                    .any(|m| m["function"] == name)
+            })
+            .unwrap_or_else(|| panic!("{name} in {doc:#}"))["status"]
+            .clone()
+    };
+    assert_eq!(status_of("one"), "unchanged");
+    assert_eq!(status_of("five"), "grown");
+    assert_eq!(status_of("six"), "new");
+    // And the document validates against the delta schema
+    assert_matches_schema("schemas/delta-v2.json", &doc);
+}
+
+#[test]
+fn a_baseline_with_no_duplicate_record_shows_every_group() {
+    // Given a baseline recorded with `--format json` and no `--duplicates`
+    let (dir, store) = (
+        TempDir::new().expect("temp dir"),
+        TempDir::new().expect("temp dir"),
+    );
+    write(
+        dir.path(),
+        "a.rs",
+        &[filter_copy("one"), filter_copy("two")].concat(),
+    );
+    write(
+        dir.path(),
+        "b.rs",
+        &[tally_copy("three"), tally_copy("four")].concat(),
+    );
+    let baseline = store.path().join("base.json");
+    let recorded = run_inside(
+        dir.path(),
+        "json",
+        &["--output", baseline.to_str().expect("utf-8")],
+    );
+    assert!(recorded.status.success(), "the baseline is written");
+    // When I run `cargo crap --duplicates --baseline base.json --format pr-comment`
+    let out = run_inside(
+        dir.path(),
+        "pr-comment",
+        &[
+            "--duplicates",
+            "--baseline",
+            baseline.to_str().expect("utf-8"),
+        ],
+    );
+    assert!(out.status.success(), "the run succeeds: {out:?}");
+    let stdout = String::from_utf8(out.stdout).expect("utf-8");
+    let stderr = String::from_utf8(out.stderr).expect("utf-8");
+    // Then the duplicate section lists every group, as without a baseline
+    let (section, rows) = duplicate_rows(&stdout);
+    assert!(
+        section.starts_with("## 2 duplicate candidates\n"),
+        "{section}"
+    );
+    assert_eq!(rows.len(), 2, "{section}");
+    // And stderr warns once that the baseline has no duplicate record and
+    // names `--duplicates` as the fix
+    assert_eq!(stderr.matches("no duplicate record").count(), 1, "{stderr}");
+    assert!(stderr.contains("--duplicates"), "{stderr}");
+    // Delta JSON labels no group: there is nothing to label it against.
+    let json = delta_duplicates(dir.path(), &baseline, "json");
+    let doc: serde_json::Value = serde_json::from_str(&json).expect("one JSON document");
+    for group in doc["duplicate_groups"].as_array().expect("groups") {
+        assert!(group.get("status").is_none(), "{group}");
+    }
+    assert_matches_schema("schemas/delta-v2.json", &doc);
+    // And every group is triaged when triage is enabled
+    #[cfg(feature = "triage")]
+    {
+        use support::api_stub::{ApiStub, Reply};
+        let stub = ApiStub::scripted(vec![Reply::json(&triage_answer_worth(
+            "same_logic",
+            0.9,
+            3.0,
+        ))]);
+        let out = run_with_config(
+            dir.path(),
+            TRIAGE_ON,
+            &stub,
+            &[
+                "--baseline",
+                baseline.to_str().expect("utf-8"),
+                "--format",
+                "pr-comment",
+            ],
+        );
+        let stdout = String::from_utf8(out.stdout).expect("utf-8");
+        assert_eq!(stub.request_count(), 2, "{stdout}");
+        let (section, rows) = duplicate_rows(&stdout);
+        assert_eq!(rows.len(), 2, "{section}");
+        assert!(rows.iter().all(|r| r.starts_with("| 🔴 |")), "{section}");
+    }
 }
