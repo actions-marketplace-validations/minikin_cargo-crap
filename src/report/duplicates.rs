@@ -24,7 +24,8 @@ pub use crate::duplicates::compare::sort_pairs;
 /// missing line can be read as a verdict.
 ///
 /// Library API for callers that report pairs on their own: the binary
-/// groups its pairs and prints them with [`render_grouped`].
+/// groups its pairs and prints them with [`render_grouped`], followed by the
+/// triage budget's line when it left a group unasked.
 ///
 /// # Errors
 ///
@@ -70,6 +71,22 @@ pub fn render_grouped(
         write_group(group, triage.and_then(|t| t[n].as_ref()), out)?;
     }
     Ok(())
+}
+
+/// The human duplicate section: [`render_grouped`] over `groups` with
+/// `opts.triage`, then the triage budget's line when it left any group
+/// unasked. On a delta run the section lists every group but triage asked
+/// only about the new and grown ones, so the line names how many those are.
+pub(crate) fn render_human_section(
+    groups: &[DuplicateGroup],
+    opts: &RenderOptions,
+    out: &mut dyn Write,
+) -> Result<()> {
+    render_grouped(groups, opts.triage, out)?;
+    let reported = covering_comparison(opts, groups.len()).map(|c| c.reported().count());
+    // Never more than the groups listed, and so nothing under an empty section.
+    let untriaged = opts.untriaged.min(reported.unwrap_or(groups.len()));
+    write_budget_line(untriaged, reported, out)
 }
 
 /// One group: a pair's heading for two members, the group's size and
@@ -252,15 +269,31 @@ fn write_closing_lines(
     triaged_by: Option<TriagedBy<'_>>,
     out: &mut dyn Write,
 ) -> Result<()> {
-    if untriaged > 0 {
-        let verb = if untriaged == 1 { "was" } else { "were" };
-        writeln!(
-            out,
-            "\n{untriaged} {} {verb} not triaged: the run's triage budget ran out.",
-            noun(untriaged)
-        )?;
-    }
+    write_budget_line(untriaged, None, out)?;
     write_provider_line(triaged_by, out)
+}
+
+/// The line saying how many candidates the triage budget left unasked, when
+/// it left any: of the `new` candidates triage was asked about when given,
+/// for a section that lists more than those.
+fn write_budget_line(
+    untriaged: usize,
+    new: Option<usize>,
+    out: &mut dyn Write,
+) -> Result<()> {
+    if untriaged == 0 {
+        return Ok(());
+    }
+    let verb = if untriaged == 1 { "was" } else { "were" };
+    let counted = match new {
+        Some(new) => format!("{untriaged} of the {new} new {}", noun(new)),
+        None => format!("{untriaged} {}", noun(untriaged)),
+    };
+    writeln!(
+        out,
+        "\n{counted} {verb} not triaged: the run's triage budget ran out."
+    )?;
+    Ok(())
 }
 
 /// The line naming who triaged the table, when it is triaged and someone is
@@ -2115,6 +2148,114 @@ mod tests {
                     proptest::prop_assert!(out.starts_with(&heading), "{}", out);
                 }
             }
+        }
+    }
+
+    mod human_budget_line {
+        use super::*;
+        use crate::duplicates::novelty::{Comparison, Novelty};
+        use crate::report::{Format, render_duplicates};
+
+        fn human(
+            groups: &[DuplicateGroup],
+            triage: Option<&[Option<Assessment>]>,
+            novelty: Option<&Comparison>,
+            untriaged: usize,
+        ) -> String {
+            let opts = crate::report::RenderOptions {
+                format: Format::Human,
+                groups: Some(groups),
+                triage,
+                novelty,
+                untriaged,
+                ..at_work()
+            };
+            let mut buf = Vec::new();
+            render_duplicates(&opts, &mut buf).expect("a Vec writer cannot fail");
+            String::from_utf8(buf).expect("utf-8")
+        }
+
+        #[test]
+        fn the_human_section_ends_with_the_budget_line() {
+            let groups = [pair_group(0), pair_group(1)];
+            let out = human(&groups, None, None, 2);
+            assert!(
+                out.ends_with(
+                    "\n2 candidates were not triaged: the run's triage budget ran out.\n"
+                ),
+                "{out}"
+            );
+            let one = human(&groups, None, None, 1);
+            assert!(
+                one.ends_with("\n1 candidate was not triaged: the run's triage budget ran out.\n"),
+                "{one}"
+            );
+        }
+
+        #[test]
+        fn without_a_skipped_group_the_human_section_is_unchanged() {
+            let groups = [pair_group(0), pair_group(1)];
+            let mut plain = b"\n".to_vec();
+            render_grouped(&groups, None, &mut plain).expect("a Vec writer cannot fail");
+            assert_eq!(
+                human(&groups, None, None, 0),
+                String::from_utf8(plain).expect("utf-8")
+            );
+        }
+
+        #[test]
+        fn the_line_follows_the_last_verdict() {
+            let groups = [pair_group(0), pair_group(1)];
+            let triage = [Some(asserted(Kind::SameLogic, 0.9, 3.0)), None];
+            let out = human(&groups, Some(&triage), None, 1);
+            let verdict = out.find("  triage: ").expect("the verdict line");
+            let line = out
+                .find("1 candidate was not triaged")
+                .expect("the budget line");
+            assert!(verdict < line, "{out}");
+            assert!(out.ends_with("budget ran out.\n"), "{out}");
+        }
+
+        #[test]
+        fn a_delta_run_names_the_new_candidates() {
+            let groups = [pair_group(0), pair_group(1), pair_group(2)];
+            let comparison = Comparison {
+                novelty: vec![Novelty::Unchanged, Novelty::New, Novelty::New],
+                resolved: 0,
+            };
+            let one = human(&groups, None, Some(&comparison), 1);
+            assert!(
+                one.ends_with(
+                    "\n1 of the 2 new candidates was not triaged: the run's triage budget ran out.\n"
+                ),
+                "{one}"
+            );
+            let both = human(&groups, None, Some(&comparison), 2);
+            assert!(
+                both.ends_with(
+                    "\n2 of the 2 new candidates were not triaged: the run's triage budget ran out.\n"
+                ),
+                "{both}"
+            );
+            let lone = Comparison {
+                novelty: vec![Novelty::Unchanged, Novelty::Unchanged, Novelty::New],
+                resolved: 0,
+            };
+            let single = human(&groups, None, Some(&lone), 1);
+            assert!(
+                single.ends_with(
+                    "\n1 of the 1 new candidate was not triaged: the run's triage budget ran out.\n"
+                ),
+                "{single}"
+            );
+        }
+
+        #[test]
+        fn an_empty_section_has_no_budget_line() {
+            assert_eq!(
+                human(&[], None, None, 2),
+                "\nNo candidate duplicates found.\n"
+            );
         }
     }
 

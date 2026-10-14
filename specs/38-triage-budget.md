@@ -1,8 +1,8 @@
 # Spec 38: A triage budget
 
-**Status:** Implemented
+**Status:** Approved
 **Effort:** Medium
-**Module:** `src/duplicates/triage/mod.rs`, `src/config.rs`, `src/main.rs`, `src/report/duplicates.rs`
+**Module:** `src/duplicates/triage/mod.rs`, `src/config.rs`, `src/main.rs`, `src/report/duplicates.rs`, `src/report/json.rs`
 
 ## Context
 
@@ -17,8 +17,9 @@ Once this ships, `[duplicates.triage] max-requests = N` caps the paid
 requests one run may send. Cached verdicts are free and never count. The
 budget goes to the reported groups in report order, strongest first, so the
 groups most likely to matter are judged first. The groups past it stay
-untriaged: one warning says how many and how to raise the limit, and the
-markdown and pr-comment tables say why those rows have no verdict. Without
+untriaged: one warning says how many and how to raise the limit, the
+human, markdown and pr-comment tables say why those rows have no verdict,
+and JSON carries the count. Without
 the key nothing changes, so the default is unlimited.
 
 A budget of 0 asks nothing and needs no API key: the run shows the verdicts
@@ -140,6 +141,44 @@ And   a line under it reads
       "2 candidates were not triaged: the run's triage budget ran out."
 ```
 
+### Scenario: JSON counts the groups the budget skipped
+
+```
+Given triage is enabled with `max-requests = 1`
+And   a tree with three duplicate groups, none of them cached
+When  I run `cargo crap --duplicates --format json`
+Then  one group carries `triage` and two do not
+And   the envelope's `untriaged_groups` is 2
+When  the budget covers every group
+Then  the envelope has no `untriaged_groups` key
+```
+
+### Scenario: The human table says why rows have no verdict
+
+```
+Given triage is enabled with `max-requests = 1`
+And   a tree with three duplicate groups, none of them cached
+When  I run `cargo crap --duplicates`
+Then  a line under the duplicates table reads
+      "2 candidates were not triaged: the run's triage budget ran out."
+```
+
+### Scenario: On a delta run the human line names the new candidates
+
+```
+Given triage is enabled with `max-requests = 1`
+And   a baseline recorded with `--duplicates` holding two groups that are
+      still present
+And   the current tree adds two new pairs
+When  I run `cargo crap --duplicates --baseline base.json`
+Then  the human section lists all four groups
+And   a line under it reads
+      "1 of the 2 new candidates was not triaged: the run's triage budget
+      ran out."
+When  I run the same with `--format json`
+Then  the envelope's `untriaged_groups` is 1
+```
+
 ### Scenario: A negative budget is a configuration error
 
 ```
@@ -192,6 +231,14 @@ needs are all done is ready. `scripts/keeler-graph.sh` reads that graph.
   describe `max-requests`, the output-formats reference the budget line,
   and the CHANGELOG the feature and the library break. Needs: T4. No
   scenario: checked by the docs tests.
+- [x] **T6 — JSON and the human table report the skipped groups.** Both
+  JSON envelopes gain `untriaged_groups`, present only when non-zero, in
+  the code, the two schemas and the JSON reference, and the human
+  duplicates section prints the budget line, naming the new candidates on
+  a delta run. Needs: T5. Scenarios: _JSON counts the groups the budget
+  skipped_, _The human table says why rows have no verdict_, _On a delta
+  run the human line names the new candidates_. Tests: unit + acceptance
+  + schema validation.
 
 ---
 
@@ -233,8 +280,12 @@ budget ran out.` (`was` for one), whether or not any row has a verdict:
 with a budget of 0 on a cold cache the table has no verdict columns, and
 the line is the one place a reader learns why. The lines under the table
 come in this order: the truncation footer, spec 37's count line, the
-budget line, the provider line. The human section and JSON say nothing
-more: the verdict is absent, and the warning is on stderr.
+budget line, the provider line. The human section prints the same line
+under its groups. On a delta run it lists every group but triage asked
+only about the new and grown ones, so the line names them: `1 of the 2 new
+candidates was not triaged: the run's triage budget ran out.` JSON envelopes, the plain report and the delta, carry the
+count as `untriaged_groups`, present only when it is not zero, so a
+consumer can tell a verdict the budget skipped from triage being off.
 
 **Invariants worth a property test** (on the pure selection step, fed a
 hit-or-miss list and a budget):

@@ -364,6 +364,38 @@ fn duplicates_json_output_validates_against_published_schema() {
 }
 
 #[test]
+fn both_schemas_carry_the_untriaged_group_count() {
+    // The count is written only when the budget skipped a group, so 0 is
+    // never on the wire and both envelopes refuse it. It counts groups, so a
+    // document without them cannot carry it.
+    let report = serde_json::json!({"version": "0.8.0", "entries": [], "duplicate_groups": []});
+    let mut delta = report.clone();
+    delta["removed"] = serde_json::json!([]);
+    for (path, doc) in [
+        ("schemas/report-v1.json", report),
+        ("schemas/delta-v2.json", delta),
+    ] {
+        let validator = compile_schema(path);
+        let with = |n: i64| {
+            let mut doc = doc.clone();
+            doc["untriaged_groups"] = n.into();
+            doc
+        };
+        assert_valid(&validator, &with(3));
+        assert!(!validator.is_valid(&with(0)), "{path} accepts 0");
+        let mut alone = with(3);
+        alone
+            .as_object_mut()
+            .expect("an object")
+            .remove("duplicate_groups");
+        assert!(
+            !validator.is_valid(&alone),
+            "{path} accepts a count of nothing"
+        );
+    }
+}
+
+#[test]
 fn both_schemas_enforce_the_shared_duplicate_definitions() {
     // A member without its function name breaks `DuplicateMember`, which
     // lives in duplicates-v1.json: both envelopes must reject it, so the
