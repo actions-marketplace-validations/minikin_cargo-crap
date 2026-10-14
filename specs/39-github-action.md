@@ -1,6 +1,6 @@
 # Spec 39: A GitHub Action
 
-**Status:** Implemented
+**Status:** Approved
 **Effort:** Large
 **Module:** `action.yml` (new), `scripts/action/` (new), `.github/workflows/action.yml` (new), `.github/workflows/demo.yml`, `.github/workflows/release.yml`, `docs/`
 
@@ -189,6 +189,43 @@ When  the Action runs
 Then  both the pull request's run and the base-commit run pass them
 ```
 
+### Scenario: The test seams are ignored outside this repository
+
+```
+Given a repository other than minikin/cargo-crap
+And   `CARGO_CRAP_TEST_API_URL` and `CARGO_CRAP_TEST_PR_NUMBER` in the job's
+      environment
+When  the Action comments
+Then  it comments through `github.api_url` on the pull request that
+      started the run
+```
+
+### Scenario: The triage budget is spent once per job
+
+```
+Given duplicate triage is enabled with `max-requests = 2`, five groups
+      without a cached verdict, and a provider key in the environment
+When  the Action runs on a pull request
+Then  the provider receives exactly two requests
+```
+
+### Scenario: Arguments that cannot be split fail the step
+
+```
+Given `args: --threshold 20'`
+When  the Action runs
+Then  the step fails naming `args`, before anything is scored
+```
+
+### Scenario: An archive that does not match the release's sums is refused
+
+```
+Given a downloaded archive whose digest is not the one `SHA256SUMS` lists
+When  the Action installs it
+Then  the step fails naming the archive
+And   no cargo-crap is put on `PATH`
+```
+
 ---
 
 ## Tasks
@@ -231,6 +268,19 @@ needs are all done is ready. `scripts/keeler-graph.sh` reads that graph.
   `v1`, the demo runs through `uses: ./` with its own marker, and the
   README, the CI guides and the CHANGELOG show the one-step setup. Needs: T4. No scenario: checked by the docs
   tests and the demo's comment.
+- [x] **T6 — The test seams work only here.** The Comment step reads
+  the test seams only when `github.repository` is minikin/cargo-crap, and
+  the guide states the trust boundary. Needs: T5. Scenarios: _The test
+  seams are ignored outside this repository_. Tests: a docs test over
+  `action.yml`, since CI runs only in this repository.
+- [x] **T7 — The budget is spent once, and bad arguments fail.** The gate
+  run clears the provider keys, and input that cannot be split into words
+  fails the step. Needs: T6. Scenarios: _The triage budget is spent once
+  per job_, _Arguments that cannot be split fail the step_. Tests: shell +
+  CI scenario jobs.
+- [x] **T8 — Release checksums.** The release job publishes `SHA256SUMS`,
+  and install verifies the archive against it. Needs: T7. Scenarios: _An
+  archive that does not match the release's sums is refused_. Tests: shell.
 
 ---
 
@@ -279,7 +329,12 @@ for the newest release on each run. **Outputs:** `crappy` (functions above the t
 `cargo-crap-{target}.tar.gz` or `.zip` on Windows, from the release tagged
 `v{version}`, or from the latest release. Downloaded with `gh release
 download` or `curl`, unpacked with `tar` or, on Windows, the `unzip` Git
-Bash ships, and put on `PATH`.
+Bash ships, and put on `PATH`. The release job publishes `SHA256SUMS`
+beside the archives, and install refuses an archive whose digest is not the
+one listed. Releases before 0.8.0 had the file attached afterwards,
+computed from the assets they held, so every version installs verified and
+one without the file does not install. This catches a corrupted or replaced asset, not a
+compromised release, which could replace the file too.
 
 **Coverage.** Without `lcov`, `cargo llvm-cov --lcov --output-path` runs
 with `coverage-args`, after `taiki-e/install-action` installs
@@ -303,7 +358,10 @@ request) or `--format markdown` (on a push) to a file, appended to the job
 summary and named by `report`. A `--format json` run of the same inputs
 fills the outputs. On a pull request the links point at the pull request's
 head commit (`--commit-ref` with the head SHA), not the merge commit
-`GITHUB_SHA` names. The comment is found by `comment-marker`: the default is
+`GITHUB_SHA` names: GitHub deletes a pull request's merge ref when it
+closes, and keeps the head ref, so the links outlive the pull request. A
+line number can be off by a few lines when the base changed the same file
+after the branch point. The comment is found by `comment-marker`: the default is
 the marker the pr-comment format starts with, and any other marker is put
 on the comment's first line. It is updated if present and created
 otherwise, through the REST API with `github-token`. A 403 or 404 there is
@@ -312,7 +370,16 @@ the comment's whole first line, and an empty one is refused, so a comment
 written by someone else is never taken for the Action's.
 
 **Gate.** Last, after the comment: the gate run adds `--fail-regression`
-and `--fail-above` per the inputs, and its exit code is the step's.
+and `--fail-above` per the inputs, and its exit code is the step's. It
+clears every provider's key as the base run does, and so does the badge
+run: the report run has already spent the triage budget, and a second run
+with a key would spend it again on the groups the first one skipped. The
+gate counts score regressions, which need no verdict.
+
+**Arguments.** `args` and `coverage-args` are split into words as the shell
+would, quotes and backslashes included, and nothing in them is executed.
+Input that cannot be split, such as a stray quote, fails the step naming
+the input, so no run goes ahead with arguments missing.
 
 **Versioning.** `v1` is a moving tag on the commit of each 0.x release
 whose `action.yml` keeps the v1 inputs. The release workflow moves it to
@@ -329,7 +396,17 @@ outputs and the summary file. The comment scenarios start a small local
 HTTP server that stands in for the GitHub API and assert on the requests it
 received. GitHub does not let a step override `GITHUB_API_URL`, so the
 comment step reads two test seams first, `CARGO_CRAP_TEST_API_URL` and
-`CARGO_CRAP_TEST_PR_NUMBER`, named so no real workflow sets them by chance.
+`CARGO_CRAP_TEST_PR_NUMBER`, and only when `github.repository` is
+minikin/cargo-crap, so no other repository's job, and no code that writes
+its environment, can point the token at another host through them.
+
+**Trust.** The Action runs the pull request's build scripts and tests in
+the job that holds the comment token, and code that runs there can reach
+the token by other means (a proxy variable written to `GITHUB_ENV`, or a
+replaced binary). No step order inside the Action prevents that. The
+boundary is the event: on `pull_request` a fork's token is read-only and a
+branch's author can already write. The guide says to keep the Action off
+`pull_request_target` with a fork's code checked out.
 The scripts' small pieces (the target triple, the word splitting, the input
 checks) get shell tests run by `just`. The demo workflow switches to `uses: ./` with its own
 `comment-marker`, so the showcase on #119 runs through the Action and never

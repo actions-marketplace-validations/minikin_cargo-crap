@@ -468,6 +468,76 @@ jobs:
           if grep -q 'fn two' "$RUNNER_TEMP/api.log"; then exit 1; fi
           if grep -q '"triage"' "$RUNNER_TEMP"/cargo-crap.*/base.json; then exit 1; fi
 
+  pr-budget:
+    name: The triage budget is spent once per job
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v4
+        with:
+          name: cargo-crap-under-test
+          path: ${{ runner.temp }}/bin
+      - name: Five new groups, none cached, and a budget of two
+        id: shop
+        run: |
+          scripts/action/fixture.sh "$RUNNER_TEMP/shop" five-groups
+          printf '[duplicates]\nenabled = true\n\n[duplicates.triage]\nenabled = true\nmax-requests = 2\n' \
+            > "$RUNNER_TEMP/shop/.cargo-crap.toml"
+          echo "base=$(git -C "$RUNNER_TEMP/shop" rev-parse HEAD~1)" >> "$GITHUB_OUTPUT"
+          python3 scripts/action/stub.py 8765 "$RUNNER_TEMP/api.log" verdicts &
+          sleep 1
+      - uses: ./
+        with:
+          binary: ${{ runner.temp }}/bin/cargo-crap
+          working-directory: ${{ runner.temp }}/shop
+          base: ${{ steps.shop.outputs.base }}
+          comment: false
+        env:
+          TYPESAFE_API_KEY: not-a-key
+          TYPESAFE_BASE_URL: http://127.0.0.1:8765
+      # Five groups, so a second paid run would have three more to ask.
+      - name: Two requests in the whole job, over five groups
+        run: |
+          test "$(grep -c '/v1/systemone' "$RUNNER_TEMP/api.log")" = 2
+          groups="$("$RUNNER_TEMP/bin/cargo-crap" --path "$RUNNER_TEMP/shop" --duplicates --format json 2> /dev/null \
+            | python3 -c 'import json, sys; print(len(json.load(sys.stdin)["duplicate_groups"]))')"
+          test "$groups" = 5
+
+  bad-args:
+    name: Arguments that cannot be split fail the step
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v4
+        with:
+          name: cargo-crap-under-test
+          path: ${{ runner.temp }}/bin
+      - name: A small tested crate
+        run: scripts/action/fixture.sh "$RUNNER_TEMP/shop"
+      - uses: ./
+        id: crap
+        continue-on-error: true
+        with:
+          binary: ${{ runner.temp }}/bin/cargo-crap
+          working-directory: ${{ runner.temp }}/shop
+          base: ""
+          args: --threshold 20'
+      # The split is the first thing the score step writes to its directory:
+      # an empty words file and nothing else means it stopped there.
+      - name: Failed at the split, before anything was scored
+        env:
+          OUTCOME: ${{ steps.crap.outcome }}
+          REPORT: ${{ steps.crap.outputs.report }}
+        run: |
+          test "$OUTCOME" = failure
+          test -z "$REPORT"
+          work=("$RUNNER_TEMP"/cargo-crap.*)
+          test "${#work[@]}" = 1
+          test "$(ls -A "${work[0]}")" = args.words
+          test ! -s "${work[0]}/args.words"
+
   pr-args:
     name: Extra arguments reach cargo-crap
     needs: build

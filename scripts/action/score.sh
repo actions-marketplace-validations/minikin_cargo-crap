@@ -21,13 +21,25 @@ file_input lcov "$given_lcov"
 file_input baseline "$given_baseline"
 # Each step its own directory, so two steps in one job keep their reports.
 work="$(mktemp -d "$RUNNER_TEMP/cargo-crap.XXXXXX")"
+# Split before anything runs, through files so an empty word survives, as
+# plain commands so input that cannot be split stops the step here.
+words_of args "$CRAP_ARGS" > "$work/args.words"
+words_of coverage-args "$CRAP_COVERAGE_ARGS" > "$work/coverage-args.words"
 args=()
 coverage_args=()
-while IFS= read -r word; do args+=("$word"); done < <(split_words "$CRAP_ARGS")
-while IFS= read -r word; do coverage_args+=("$word"); done < <(split_words "$CRAP_COVERAGE_ARGS")
+while IFS= read -r word; do args+=("$word"); done < "$work/args.words"
+while IFS= read -r word; do coverage_args+=("$word"); done < "$work/coverage-args.words"
 
 cover() {
     cargo llvm-cov --lcov --output-path "$1" ${coverage_args[@]+"${coverage_args[@]}"}
+}
+
+# Run a command with every provider key cleared, which cargo-crap reads as
+# unset, so it sends no triage request. Triage is all or nothing: with a
+# group left to ask and no key, the run reports no verdict at all, which
+# none of the unpaid runs needs.
+unpaid() {
+    TYPESAFE_API_KEY='' OPENAI_API_KEY='' "$@"
 }
 
 # The `.cargo-crap.toml` cargo-crap would read from here, up to the
@@ -109,7 +121,7 @@ score_base() {
         cp "$work/pr-config.toml" "$pr_config"
     fi
     cover "$work/base.lcov"
-    TYPESAFE_API_KEY='' OPENAI_API_KEY='' cargo-crap --lcov "$work/base.lcov" \
+    unpaid cargo-crap --lcov "$work/base.lcov" \
         ${args[@]+"${args[@]}"} --format json --output "$work/base.json"
     trap - EXIT
     restore
@@ -152,9 +164,10 @@ crap() {
 }
 
 # Links at the pull request's own head, not the merge commit GITHUB_SHA
-# names on a pull_request event. cargo-crap writes paths relative to the
-# working directory, so a crate in a subdirectory carries it in the ref:
-# `blob/<sha>/crates/foo/src/lib.rs`.
+# names on a pull_request event: GitHub deletes the merge ref when the pull
+# request closes and keeps the head ref, so the links outlive it.
+# cargo-crap writes paths relative to the working directory, so a crate in a
+# subdirectory carries it in the ref: `blob/<sha>/crates/foo/src/lib.rs`.
 links=()
 ref="${CRAP_HEAD_SHA:-${GITHUB_SHA:-}}"
 if [ -n "$ref" ]; then
@@ -178,7 +191,7 @@ cp "$GITHUB_STEP_SUMMARY" "$work/summary.md"
 
 # Its stderr kept aside: with duplicates on in config, every badge run says
 # they do not apply to it, and only a failure should show.
-if ! badge="$(crap --format shields 2> "$work/badge.err")"; then
+if ! badge="$(unpaid crap --format shields 2> "$work/badge.err")"; then
     cat "$work/badge.err" >&2
     echo "::error::cargo-crap could not count the functions above the threshold"
     exit 1
@@ -195,7 +208,10 @@ fi
 
 # One JSON run is both the gate and, on a pull request, the regression
 # count. Its status goes to the `status` output, which the Action's last
-# step exits with, so the comment is posted before the step fails.
+# step exits with, so the comment is posted before the step fails. It runs
+# unpaid: the report run has spent the triage budget, a run with a key would
+# spend it again, and score regressions need no verdict. Its triage warnings
+# are about that missing key, not the job's, so they are left out.
 gate=()
 if [ "$fail_above" = true ]; then
     gate+=(--fail-above)
@@ -204,7 +220,8 @@ if [ "${#compared[@]}" -gt 0 ] && [ "$fail_regression" = true ]; then
     gate+=(--fail-regression)
 fi
 status=0
-crap ${gate[@]+"${gate[@]}"} --format json --output "$work/result.json" || status=$?
+unpaid crap ${gate[@]+"${gate[@]}"} --format json --output "$work/result.json" 2> "$work/gate.err" || status=$?
+grep -v -e '^warning: duplicate triage skipped' -e '^warning: the triage budget' "$work/gate.err" >&2 || true
 # 2 is cargo-crap failing to run, not a gate: nothing to count.
 if [ "$status" -ge 2 ]; then
     exit "$status"
