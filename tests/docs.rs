@@ -324,3 +324,30 @@ fn every_marked_sample_output_matches_a_real_run() {
         "expected the README and getting-started samples"
     );
 }
+
+/// The `default:` of input `name`, under `inputs:` in `action.yml`.
+fn action_input_default(name: &str) -> Option<String> {
+    let action = read("action.yml");
+    let mut lines = action
+        .lines()
+        .skip_while(|l| *l != "inputs:")
+        .skip(1)
+        .take_while(|l| l.is_empty() || l.starts_with(' '))
+        .skip_while(|l| *l != format!("  {name}:"));
+    lines.next()?;
+    lines
+        .take_while(|l| l.starts_with("    "))
+        .find_map(|l| l.trim().strip_prefix("default:"))
+        .map(|v| v.trim().trim_matches('"').to_owned())
+}
+
+#[test]
+fn the_action_installs_this_release_by_default() {
+    // `uses: minikin/cargo-crap@v1` must install the release its tag was
+    // cut with, so the default moves with `Cargo.toml` in the release
+    // pull request.
+    assert_eq!(
+        action_input_default("version").as_deref(),
+        Some(env!("CARGO_PKG_VERSION"))
+    );
+}
