@@ -30,6 +30,10 @@ pub struct SourceLinks {
     /// The repository root on disk, which absolute paths are made relative
     /// to. `None` uses the process's working directory.
     root: Option<PathBuf>,
+    /// The workspace root a workspace-mode report writes its paths below
+    /// (spec 41). A relative path is joined to it before `root` is
+    /// stripped, so the URL is the one the absolute path would give.
+    workspace_root: Option<PathBuf>,
 }
 
 impl SourceLinks {
@@ -48,6 +52,7 @@ impl SourceLinks {
             repo_url: repo_url.trim_end_matches('/').to_string(),
             commit_ref,
             root: None,
+            workspace_root: None,
         }
     }
 
@@ -60,6 +65,17 @@ impl SourceLinks {
         root: PathBuf,
     ) -> Self {
         self.root = Some(root);
+        self
+    }
+
+    /// The same links, for a report whose paths are written below
+    /// `workspace_root` (spec 41).
+    #[must_use]
+    pub fn with_workspace_root(
+        mut self,
+        workspace_root: PathBuf,
+    ) -> Self {
+        self.workspace_root = Some(workspace_root);
         self
     }
 
@@ -131,7 +147,12 @@ pub(crate) fn linkify(
     let Some(links) = links else {
         return inner;
     };
-    match link_path(file, links.root.as_deref()) {
+    // `join` keeps an absolute `file` as it is.
+    let file = links.workspace_root.as_deref().map_or_else(
+        || file.to_path_buf(),
+        |workspace_root| workspace_root.join(file),
+    );
+    match link_path(&file, links.root.as_deref()) {
         Some(path) => format!("[{inner}]({})", links.url_for(&path, line)),
         None => inner,
     }
@@ -140,6 +161,31 @@ pub(crate) fn linkify(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_workspace_relative_path_links_as_its_absolute_path_would() {
+        // A root without a drive letter is not absolute on Windows.
+        let ws = PathBuf::from(if cfg!(windows) { r"C:\ws" } else { "/ws" });
+        let links = SourceLinks::new("https://github.com/o/r".into(), "abc".into())
+            .with_root(ws.join("crates/beta"))
+            .with_workspace_root(ws.clone());
+        let at = |file: &Path| linkify("x".into(), Some(&links), file, 3);
+        let relative = Path::new("crates/beta/src/a.rs");
+        assert_eq!(
+            at(relative),
+            at(&ws.join(relative)),
+            "the relative and the absolute path link alike"
+        );
+        assert_eq!(
+            at(relative),
+            "[x](https://github.com/o/r/blob/abc/src/a.rs#L3)"
+        );
+        assert_eq!(
+            at(Path::new("crates/alpha/src/a.rs")),
+            "x",
+            "outside the root: no link"
+        );
+    }
 
     #[test]
     fn source_links_url_for_joins_components_with_one_slash() {

@@ -764,6 +764,1012 @@ fn matching_weights_compare_silently() {
     assert_eq!(delta["entries"][0]["status"], "unchanged", "{delta}");
 }
 
+// --- Spec 40 · Exclude globs also match workspace-relative paths -----------
+
+// ---- Spec 40 · T2 ----
+
+/// A fresh copy of `tests/fixtures/spec40_workspace`: a virtual manifest,
+/// `agent2` at `agent/`, `agent2-rules` at `crates/rules/` and `harness` at
+/// `tests/harness/`, with `src/generated/gen.rs` in the first two. Every
+/// function's name says where it lives. Copied so a test can add a config
+/// and the run's cache lands outside the repository.
+fn spec40_workspace() -> TempDir {
+    let dir = TempDir::new().expect("temp dir");
+    copy_tree(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/spec40_workspace"),
+        dir.path(),
+    );
+    dir
+}
+
+fn copy_tree(
+    from: &Path,
+    to: &Path,
+) {
+    for entry in fs::read_dir(from).expect("read fixture dir") {
+        let entry = entry.expect("fixture entry");
+        let target = to.join(entry.file_name());
+        if entry.file_type().expect("file type").is_dir() {
+            fs::create_dir_all(&target).expect("mkdir");
+            copy_tree(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), &target).expect("copy fixture file");
+        }
+    }
+}
+
+/// The function names a JSON run in `dir` reports, sorted.
+fn reported_functions(
+    dir: &Path,
+    args: &[&str],
+) -> Vec<String> {
+    let mut names = strings_at(&json_in(dir, args)["entries"], "function");
+    names.sort();
+    names
+}
+
+#[test]
+fn a_workspace_relative_exclude_drops_a_whole_member() {
+    // Given the workspace
+    let ws = spec40_workspace();
+    // When I run `cargo crap --workspace --exclude 'agent/**'`
+    let names = reported_functions(ws.path(), &["--workspace", "--exclude", "agent/**"]);
+    // Then no function from agent/ appears in the output
+    // And the functions from crates/rules/ are still shown
+    assert_eq!(names, ["harness_src", "rules_generated", "rules_src"]);
+}
+
+#[test]
+fn a_workspace_relative_exclude_in_the_config_file_drops_a_member() {
+    // Given the workspace
+    // And a .cargo-crap.toml at the workspace root with exclude = ["crates/rules/**"]
+    let ws = spec40_workspace();
+    write(
+        ws.path(),
+        ".cargo-crap.toml",
+        "exclude = [\"crates/rules/**\"]\n",
+    );
+    // When I run `cargo crap --workspace`
+    let names = reported_functions(ws.path(), &["--workspace"]);
+    // Then no function from crates/rules/ appears in the output
+    // And the functions from agent/ are still shown
+    assert_eq!(names, ["agent_generated", "agent_src", "harness_src"]);
+}
+
+#[test]
+fn a_leading_double_star_glob_matches_through_the_workspace_relative_path() {
+    // Given the workspace
+    let ws = spec40_workspace();
+    let unexcluded = reported_functions(ws.path(), &["-p", "agent2"]);
+    assert_eq!(
+        unexcluded,
+        ["agent_generated", "agent_src"],
+        "the control run"
+    );
+    // When I run `cargo crap -p agent2 --exclude '**/agent/src/**'`
+    let names = reported_functions(ws.path(), &["-p", "agent2", "--exclude", "**/agent/src/**"]);
+    // Then no function from agent/src/ appears in the output
+    assert_eq!(names, Vec::<String>::new());
+}
+
+#[test]
+fn member_relative_user_excludes_keep_working_in_every_member() {
+    // Given the workspace, with src/generated/gen.rs in both agent/ and crates/rules/
+    let ws = spec40_workspace();
+    // When I run `cargo crap --workspace --exclude 'src/generated/**'`
+    let names = reported_functions(ws.path(), &["--workspace", "--exclude", "src/generated/**"]);
+    // Then no function from either member's src/generated/ appears in the output
+    // And the other functions in each member's src/ are still shown
+    assert_eq!(names, ["agent_src", "harness_src", "rules_src"]);
+}
+
+#[test]
+fn default_excludes_do_not_get_the_workspace_base() {
+    // Given a workspace with a member `harness` at tests/harness/ holding functions in src/lib.rs
+    let ws = spec40_workspace();
+    // When I run `cargo crap --workspace`
+    let names = reported_functions(ws.path(), &["--workspace"]);
+    // Then the functions in tests/harness/src/lib.rs are shown
+    assert!(names.contains(&"harness_src".to_owned()), "{names:?}");
+}
+
+#[test]
+fn a_user_glob_equal_to_a_default_does_get_the_workspace_base() {
+    // Given a workspace with a member `harness` at tests/harness/ holding functions in src/lib.rs
+    let ws = spec40_workspace();
+    // When I run `cargo crap --workspace --exclude 'tests/**'`
+    let names = reported_functions(ws.path(), &["--workspace", "--exclude", "tests/**"]);
+    // Then no function from tests/harness/ appears in the output
+    assert!(!names.contains(&"harness_src".to_owned()), "{names:?}");
+    assert!(names.contains(&"agent_src".to_owned()), "{names:?}");
+}
+
+#[test]
+fn single_path_matching_is_unchanged() {
+    // Given a crate at crate/ with functions in crate/src/
+    let dir = TempDir::new().expect("temp dir");
+    fs::create_dir_all(dir.path().join("crate/src")).expect("mkdir");
+    write(
+        &dir.path().join("crate/src"),
+        "lib.rs",
+        "pub fn kept() {}\n",
+    );
+    // When I run `cargo crap --path crate/ --exclude 'crate/src/**'`
+    let names = reported_functions(
+        dir.path(),
+        &["--path", "crate/", "--exclude", "crate/src/**"],
+    );
+    // Then the functions in crate/src/ are still shown
+    assert_eq!(names, ["kept"]);
+}
+
+// ---- Spec 40 · T3 ----
+
+/// A function long enough to clear the duplicate pass's node floor, named
+/// `name`; any two are exact structural duplicates.
+fn spec40_duplicate(name: &str) -> String {
+    format!(
+        "pub fn {name}(xs: &[i32]) -> Vec<i32> {{
+    let mut ys = Vec::new();
+    for x in xs {{
+        if x % 2 == 1 {{
+            ys.push(x + 1);
+        }}
+    }}
+    ys
+}}
+"
+    )
+}
+
+#[test]
+fn the_duplicate_scan_honours_a_workspace_relative_exclude() {
+    // Given the workspace
+    let ws = spec40_workspace();
+    // And a pair of near-identical functions, one in agent/ and one in crates/rules/
+    // And a second pair of near-identical functions, both in crates/rules/
+    write(
+        &ws.path().join("agent/src"),
+        "dup.rs",
+        &spec40_duplicate("agent_dup"),
+    );
+    write(
+        &ws.path().join("crates/rules/src"),
+        "dup.rs",
+        &format!(
+            "{}{}",
+            spec40_duplicate("rules_dup_a"),
+            spec40_duplicate("rules_dup_b")
+        ),
+    );
+    // When I run `cargo crap --workspace --duplicates --exclude 'agent/**'`
+    let out = crap()
+        .current_dir(ws.path())
+        .args([
+            "--workspace",
+            "--duplicates",
+            "--exclude",
+            "agent/**",
+            "--format",
+            "json",
+        ])
+        .assert()
+        .success();
+    let doc: serde_json::Value =
+        serde_json::from_slice(&out.get_output().stdout).expect("json envelope");
+    let pairs: Vec<(String, String)> = doc["duplicates"]
+        .as_array()
+        .expect("a duplicates array")
+        .iter()
+        .map(|p| {
+            let name = |key: &str| p[key].as_str().expect("a function").to_owned();
+            (name("first_function"), name("second_function"))
+        })
+        .collect();
+    // Then the pair spanning agent/ and crates/rules/ is not reported
+    // And the pair inside crates/rules/ is still reported
+    assert_eq!(
+        pairs,
+        [("rules_dup_a".to_owned(), "rules_dup_b".to_owned())]
+    );
+}
+
+// ---- Spec 40 · T4 ----
+
+fn json_in(
+    dir: &Path,
+    args: &[&str],
+) -> serde_json::Value {
+    let out = crap()
+        .current_dir(dir)
+        .args(args)
+        .args(["--format", "json"])
+        .assert()
+        .success();
+    serde_json::from_slice(&out.get_output().stdout).expect("json envelope")
+}
+
+fn strings_at(
+    rows: &serde_json::Value,
+    key: &str,
+) -> Vec<String> {
+    rows.as_array()
+        .expect("an array")
+        .iter()
+        .filter_map(|row| row[key].as_str().map(str::to_owned))
+        .collect()
+}
+
+#[test]
+fn a_baseline_entry_under_a_workspace_relative_exclude_is_not_reported_removed() {
+    // Given a baseline recorded with `cargo crap --workspace --format json` in the
+    // same checkout, including functions from agent/
+    let ws = spec40_workspace();
+    let recorded = json_in(ws.path(), &["--workspace"]);
+    assert!(strings_at(&recorded["entries"], "function").contains(&"agent_src".to_owned()));
+    fs::write(ws.path().join("baseline.json"), recorded.to_string()).expect("write baseline");
+    // When I run `cargo crap --workspace --exclude 'agent/**' --baseline baseline.json`
+    let delta = json_in(
+        ws.path(),
+        &[
+            "--workspace",
+            "--exclude",
+            "agent/**",
+            "--baseline",
+            "baseline.json",
+        ],
+    );
+    // Then no function from agent/ is reported as removed
+    assert_eq!(
+        strings_at(&delta["removed"], "function"),
+        Vec::<String>::new()
+    );
+    // And no function from agent/ is paired with a current function as a move
+    let moved_from = strings_at(&delta["entries"], "previous_file");
+    let under_agent = |f: &String| Path::new(f).components().any(|c| c.as_os_str() == "agent");
+    assert!(!moved_from.iter().any(under_agent), "{moved_from:?}");
+    let mut current = strings_at(&delta["entries"], "function");
+    current.sort();
+    assert_eq!(current, ["harness_src", "rules_generated", "rules_src"]);
+}
+
+// ---- Spec 40 · T5 ----
+
+const NO_FILE: &str = "excluded no file";
+
+fn stderr_of(
+    dir: &Path,
+    args: &[&str],
+) -> String {
+    let out = crap().current_dir(dir).args(args).assert().success();
+    String::from_utf8(out.get_output().stderr.clone()).expect("utf-8")
+}
+
+fn no_match_warnings(stderr: &str) -> Vec<&str> {
+    stderr.lines().filter(|l| l.contains(NO_FILE)).collect()
+}
+
+/// A crate at the root of a temp dir with `src/lib.rs`, plus `extra` files.
+fn spec40_crate(extra: &[(&str, &str)]) -> TempDir {
+    let dir = TempDir::new().expect("temp dir");
+    for (path, body) in [("src/lib.rs", "pub fn kept() {}\n")].iter().chain(extra) {
+        let file = dir.path().join(path);
+        fs::create_dir_all(file.parent().expect("a parent")).expect("mkdir");
+        fs::write(file, body).expect("write");
+    }
+    dir
+}
+
+#[test]
+fn the_warning_in_single_path_mode_names_path_as_the_base() {
+    // Given a crate at crate/ with functions in crate/src/
+    let dir = spec40_crate(&[("crate/src/lib.rs", "pub fn inner() {}\n")]);
+    // When I run `cargo crap --path crate/ --exclude 'crate/src/**'`
+    let stderr = stderr_of(
+        dir.path(),
+        &["--path", "crate/", "--exclude", "crate/src/**"],
+    );
+    // Then stderr contains one warning naming the glob 'crate/src/**' as excluding no file
+    // And the warning says globs are relative to `--path`
+    assert_eq!(
+        no_match_warnings(&stderr),
+        ["warning: --exclude 'crate/src/**' excluded no file; globs are relative to `--path`"]
+    );
+}
+
+#[test]
+fn a_command_line_exclude_that_excludes_nothing_is_warned_about() {
+    // Given the workspace
+    let ws = spec40_workspace();
+    // When I run `cargo crap --workspace --exclude 'agnet/**'`
+    let out = crap()
+        .current_dir(ws.path())
+        .args(["--workspace", "--exclude", "agnet/**"])
+        .assert();
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).expect("utf-8");
+    // Then stderr contains one warning naming the glob 'agnet/**' as excluding no file
+    // And the warning says globs are relative to each member's directory or the workspace root
+    assert_eq!(
+        no_match_warnings(&stderr),
+        [
+            "warning: --exclude 'agnet/**' excluded no file; globs are relative to \
+          each member's directory or the workspace root"
+        ]
+    );
+    // And the exit code is the one the run would have without the glob
+    let without = crap().current_dir(ws.path()).arg("--workspace").assert();
+    assert_eq!(
+        out.get_output().status.code(),
+        without.get_output().status.code()
+    );
+}
+
+#[test]
+fn a_command_line_exclude_that_excludes_something_is_not_warned_about() {
+    // Given the workspace
+    let ws = spec40_workspace();
+    // When I run `cargo crap --workspace --exclude 'agent/**' --exclude 'agnet/**'`
+    let stderr = stderr_of(
+        ws.path(),
+        &[
+            "--workspace",
+            "--exclude",
+            "agent/**",
+            "--exclude",
+            "agnet/**",
+        ],
+    );
+    let warnings = no_match_warnings(&stderr);
+    // Then stderr contains a warning naming 'agnet/**'
+    // And stderr contains no warning naming 'agent/**'
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].contains("'agnet/**'"), "{warnings:?}");
+}
+
+#[test]
+fn overlapping_command_line_excludes_are_both_counted() {
+    // Given the workspace
+    let ws = spec40_workspace();
+    // When I run `cargo crap --workspace --exclude 'agent/**' --exclude 'agent/src/**'`
+    let stderr = stderr_of(
+        ws.path(),
+        &[
+            "--workspace",
+            "--exclude",
+            "agent/**",
+            "--exclude",
+            "agent/src/**",
+        ],
+    );
+    // Then stderr contains no warning naming 'agent/**'
+    // And stderr contains no warning naming 'agent/src/**'
+    assert_eq!(no_match_warnings(&stderr), Vec::<&str>::new());
+}
+
+#[test]
+fn a_command_line_exclude_equal_to_a_default_is_counted() {
+    // Given a crate with functions in tests/common.rs
+    let dir = spec40_crate(&[("tests/common.rs", "pub fn helper() {}\n")]);
+    // When I run `cargo crap --exclude 'tests/**'`
+    let stderr = stderr_of(dir.path(), &["--exclude", "tests/**"]);
+    // Then stderr contains no warning naming 'tests/**'
+    assert_eq!(no_match_warnings(&stderr), Vec::<&str>::new());
+}
+
+#[test]
+fn a_config_exclude_that_excludes_nothing_is_not_warned_about() {
+    // Given the workspace
+    // And a .cargo-crap.toml at the workspace root with exclude = ["agent/**"]
+    let ws = spec40_workspace();
+    write(ws.path(), ".cargo-crap.toml", "exclude = [\"agent/**\"]\n");
+    // When I run `cargo crap -p agent2-rules`
+    let stderr = stderr_of(ws.path(), &["-p", "agent2-rules"]);
+    // Then stderr contains no warning naming 'agent/**'
+    assert_eq!(no_match_warnings(&stderr), Vec::<&str>::new());
+}
+
+#[test]
+fn default_excludes_that_exclude_nothing_are_not_warned_about() {
+    // Given a crate with no tests/, benches/ or examples/ directory
+    let dir = spec40_crate(&[]);
+    // When I run `cargo crap`
+    let stderr = stderr_of(dir.path(), &[]);
+    // Then stderr contains no warning naming 'tests/**', 'benches/**' or 'examples/**'
+    assert_eq!(no_match_warnings(&stderr), Vec::<&str>::new());
+}
+
+// ---- Spec 40 · T6 ----
+
+#[test]
+fn the_help_text_names_both_bases() {
+    // When I run `cargo crap --help`
+    let out = crap().arg("--help").assert().success();
+    let help = String::from_utf8(out.get_output().stdout.clone()).expect("utf-8");
+    let help = help.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Then the --exclude description contains "relative to `--path`, or in
+    // workspace mode to each member's directory or the workspace root"
+    assert!(
+        help.contains(
+            "relative to `--path`, or in workspace mode to each member's directory \
+             or the workspace root"
+        ),
+        "{help}"
+    );
+}
+
+// --- Spec 41 · Workspace-mode reports show paths relative to the root ----
+
+/// A fresh copy of `tests/fixtures/sample_workspace` (`alpha` at
+/// `crates/alpha/`, `beta` at `crates/beta/`) with an `lcov.info` covering
+/// every line of both members by absolute path.
+fn spec41_workspace() -> TempDir {
+    let dir = TempDir::new().expect("temp dir");
+    copy_tree(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sample_workspace"),
+        dir.path(),
+    );
+    let root = os_path(dir.path());
+    let mut lcov = String::new();
+    for (member, lines) in [("alpha", 15), ("beta", 3)] {
+        let file = root.join(format!("crates/{member}/src/lib.rs"));
+        writeln!(lcov, "SF:{}", file.display()).expect("write");
+        for line in 1..=lines {
+            writeln!(lcov, "DA:{line},1").expect("write");
+        }
+        lcov.push_str("end_of_record\n");
+    }
+    write(dir.path(), "lcov.info", &lcov);
+    dir
+}
+
+/// Every `<file>:<line>` code span in `text`.
+fn code_span_locations(text: &str) -> Vec<&str> {
+    text.split('`')
+        .skip(1)
+        .step_by(2)
+        .filter(|span| span.contains(".rs:"))
+        .collect()
+}
+
+/// `text` with Windows separators written as `/`: spec 41 leaves the
+/// separator alone, and these tests check where a path starts, not how it
+/// is spelled.
+fn slashes(text: &str) -> String {
+    text.replace('\\', "/")
+}
+
+/// Stdout of a successful run in `dir`, separators as [`slashes`] writes them.
+fn stdout_in(
+    dir: &Path,
+    args: &[&str],
+) -> String {
+    let out = crap().current_dir(dir).args(args).assert().success();
+    slashes(&String::from_utf8(out.get_output().stdout.clone()).expect("utf-8"))
+}
+
+// ---- Spec 41 · T2 ----
+
+#[test]
+fn the_human_table_shows_workspace_relative_locations() {
+    // Given the workspace
+    let ws = spec41_workspace();
+    // When I run `cargo crap --workspace --lcov lcov.info`
+    let stdout = stdout_in(ws.path(), &["--workspace", "--lcov", "lcov.info"]);
+    // Then the Location of alpha's functions starts with "crates/alpha/src/lib.rs:"
+    assert!(stdout.contains("crates/alpha/src/lib.rs:"), "{stdout}");
+    // And no Location contains the workspace root's absolute path
+    let root = os_path(ws.path());
+    for absolute in [ws.path(), root.as_path()] {
+        let absolute = slashes(absolute.to_str().expect("utf-8"));
+        assert!(
+            !stdout.contains(absolute.as_str()),
+            "{absolute} in {stdout}"
+        );
+    }
+}
+
+#[test]
+fn a_p_run_shows_workspace_relative_locations() {
+    // Given the workspace
+    let ws = spec41_workspace();
+    // When I run `cargo crap -p alpha --lcov lcov.info --format markdown`
+    let stdout = stdout_in(
+        ws.path(),
+        &["-p", "alpha", "--lcov", "lcov.info", "--format", "markdown"],
+    );
+    // Then every location in the output starts with "crates/alpha/src/lib.rs:"
+    let locations = code_span_locations(&stdout);
+    assert!(!locations.is_empty(), "{stdout}");
+    assert!(
+        locations
+            .iter()
+            .all(|l| l.starts_with("crates/alpha/src/lib.rs:")),
+        "{locations:?}"
+    );
+}
+
+#[test]
+fn source_link_text_is_relative_and_the_url_is_unchanged() {
+    // Given the workspace
+    let ws = spec41_workspace();
+    // When I run `cargo crap --workspace --lcov lcov.info --format markdown
+    //   --repo-url https://github.com/o/r --commit-ref abc123`
+    let stdout = stdout_in(
+        ws.path(),
+        &[
+            "--workspace",
+            "--lcov",
+            "lcov.info",
+            "--format",
+            "markdown",
+            "--repo-url",
+            "https://github.com/o/r",
+            "--commit-ref",
+            "abc123",
+        ],
+    );
+    // Then the link text for alpha's top function reads "crates/alpha/src/lib.rs:<line>"
+    // And its URL is "https://github.com/o/r/blob/abc123/crates/alpha/src/lib.rs#L<line>"
+    let link = stdout
+        .split("[`crates/alpha/src/lib.rs:")
+        .nth(1)
+        .unwrap_or_else(|| panic!("a relative link text: {stdout}"));
+    let (line_no, rest) = link.split_once("`](").expect("a link");
+    assert_eq!(
+        rest.split_once(')').expect("a closed link").0,
+        format!("https://github.com/o/r/blob/abc123/crates/alpha/src/lib.rs#L{line_no}")
+    );
+    // From a member directory the URL is still the one the absolute path gives:
+    // the path below the working directory.
+    let from_beta = stdout_in(
+        &ws.path().join("crates/beta"),
+        &[
+            "--workspace",
+            "--lcov",
+            "../../lcov.info",
+            "--format",
+            "markdown",
+            "--repo-url",
+            "https://github.com/o/r",
+            "--commit-ref",
+            "abc123",
+        ],
+    );
+    assert!(
+        from_beta.contains(
+            "[`crates/beta/src/lib.rs:1`](https://github.com/o/r/blob/abc123/src/lib.rs#L1)"
+        ),
+        "{from_beta}"
+    );
+}
+
+#[test]
+fn github_annotations_are_unchanged() {
+    // Given the workspace
+    let ws = spec41_workspace();
+    // When I run `cargo crap --workspace --lcov lcov.info --format github --threshold 0`
+    let stdout = stdout_in(
+        ws.path(),
+        &[
+            "--workspace",
+            "--lcov",
+            "lcov.info",
+            "--format",
+            "github",
+            "--threshold",
+            "0",
+        ],
+    );
+    // Then every annotation's file= parameter starts with "crates/"
+    let files: Vec<&str> = stdout
+        .lines()
+        .filter_map(|l| l.split("file=").nth(1))
+        .collect();
+    assert!(!files.is_empty(), "{stdout}");
+    assert!(files.iter().all(|f| f.starts_with("crates/")), "{files:?}");
+    // From a member directory they are still below the working directory.
+    let from_beta = stdout_in(
+        &ws.path().join("crates/beta"),
+        &[
+            "--workspace",
+            "--lcov",
+            "../../lcov.info",
+            "--format",
+            "github",
+            "--threshold",
+            "0",
+        ],
+    );
+    assert!(from_beta.contains("file=src/lib.rs,"), "{from_beta}");
+    assert!(!from_beta.contains("file=crates/"), "{from_beta}");
+}
+
+#[test]
+fn the_pr_comment_writes_workspace_relative_locations_and_links() {
+    // Given the workspace
+    let ws = spec41_workspace();
+    // When I run `cargo crap --workspace --format pr-comment --threshold 0
+    //   --repo-url https://github.com/o/r --commit-ref abc`
+    let stdout = stdout_in(
+        ws.path(),
+        &[
+            "--workspace",
+            "--lcov",
+            "lcov.info",
+            "--format",
+            "pr-comment",
+            "--threshold",
+            "0",
+            "--repo-url",
+            "https://github.com/o/r",
+            "--commit-ref",
+            "abc",
+        ],
+    );
+    // Then no location is absolute. The comment strips the rows' shared
+    // directory prefix (spec 12), which kept absolute paths out of it before
+    // spec 41 too; this pins that the workspace-relative copy keeps it so.
+    let root = os_path(ws.path());
+    for absolute in [ws.path(), root.as_path()] {
+        let absolute = slashes(absolute.to_str().expect("utf-8"));
+        assert!(
+            !stdout.contains(absolute.as_str()),
+            "{absolute} in {stdout}"
+        );
+    }
+    // And each link keeps the full workspace-relative path
+    assert!(
+        stdout.contains(
+            "[`alpha/src/lib.rs:5`](https://github.com/o/r/blob/abc/crates/alpha/src/lib.rs#L5)"
+        ),
+        "{stdout}"
+    );
+}
+
+// ---- Spec 41 · T3 ----
+
+fn entry_files(json: &serde_json::Value) -> Vec<String> {
+    let mut files: Vec<String> = strings_at(&json["entries"], "file")
+        .iter()
+        .map(|f| slashes(f))
+        .collect();
+    files.sort();
+    files.dedup();
+    files
+}
+
+#[test]
+fn json_entries_carry_workspace_relative_file_paths() {
+    // Given the workspace
+    let ws = spec41_workspace();
+    // When I run `cargo crap --workspace --lcov lcov.info --format json`
+    let json = json_in(ws.path(), &["--workspace", "--lcov", "lcov.info"]);
+    // Then every entries[].file is "crates/alpha/src/lib.rs" or "crates/beta/src/lib.rs"
+    assert_eq!(
+        entry_files(&json),
+        ["crates/alpha/src/lib.rs", "crates/beta/src/lib.rs"]
+    );
+}
+
+#[test]
+fn json_duplicate_locations_are_workspace_relative() {
+    // Given the workspace, with a near-identical pair of functions in alpha and beta
+    let ws = spec41_workspace();
+    write(
+        &ws.path().join("crates/alpha/src"),
+        "dup.rs",
+        &spec40_duplicate("alpha_dup"),
+    );
+    write(
+        &ws.path().join("crates/beta/src"),
+        "dup.rs",
+        &spec40_duplicate("beta_dup"),
+    );
+    // When I run `cargo crap --workspace --duplicates --format json`
+    let json = json_in(ws.path(), &["--workspace", "--duplicates"]);
+    // Then each duplicate member's file is "crates/alpha/src/lib.rs" or "crates/beta/src/lib.rs"
+    let pair = &json["duplicates"][0];
+    let file = |key: &str| slashes(pair[key].as_str().expect("a path"));
+    assert_eq!(file("first_file"), "crates/alpha/src/dup.rs", "{json}");
+    assert_eq!(file("second_file"), "crates/beta/src/dup.rs", "{json}");
+    let members = json["duplicate_groups"][0]["members"]
+        .to_string()
+        .replace("\\\\", "/");
+    assert!(members.contains("\"crates/alpha/src/dup.rs\""), "{members}");
+    assert!(members.contains("\"crates/beta/src/dup.rs\""), "{members}");
+}
+
+#[test]
+fn sarif_locations_are_workspace_relative() {
+    // Given the workspace
+    let ws = spec41_workspace();
+    // When I run `cargo crap --workspace --lcov lcov.info --format sarif --threshold 0`
+    let stdout = stdout_in(
+        ws.path(),
+        &[
+            "--workspace",
+            "--lcov",
+            "lcov.info",
+            "--format",
+            "sarif",
+            "--threshold",
+            "0",
+        ],
+    );
+    let sarif: serde_json::Value = serde_json::from_str(&stdout).expect("sarif json");
+    // Then every result's artifactLocation.uri starts with "crates/"
+    let uris: Vec<&str> = sarif["runs"][0]["results"]
+        .as_array()
+        .expect("results")
+        .iter()
+        .map(|r| {
+            r["locations"][0]["physicalLocation"]["artifactLocation"]["uri"]
+                .as_str()
+                .expect("a uri")
+        })
+        .collect();
+    assert!(!uris.is_empty(), "{stdout}");
+    assert!(uris.iter().all(|u| u.starts_with("crates/")), "{uris:?}");
+}
+
+#[test]
+fn paths_do_not_depend_on_the_working_directory() {
+    // Given the workspace
+    let ws = spec41_workspace();
+    // When I run `cargo crap --workspace --lcov lcov.info --format json` from crates/beta/
+    let from_beta = json_in(
+        &ws.path().join("crates/beta"),
+        &["--workspace", "--lcov", "../../lcov.info"],
+    );
+    // Then the entries[].file values are the ones the same run gives from the workspace root
+    let from_root = json_in(ws.path(), &["--workspace", "--lcov", "lcov.info"]);
+    assert_eq!(entry_files(&from_beta), entry_files(&from_root));
+}
+
+#[test]
+fn a_member_outside_the_workspace_root_keeps_its_absolute_path() {
+    // Given a workspace at ws/ with a member `outside` at a sibling directory,
+    // joined with package.workspace = "../ws"
+    let dir = TempDir::new().expect("temp dir");
+    let root = os_path(dir.path());
+    fs::create_dir_all(root.join("ws/inside/src")).expect("mkdir");
+    fs::create_dir_all(root.join("outside/src")).expect("mkdir");
+    write(
+        &root.join("ws"),
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"inside\", \"../outside\"]\nresolver = \"2\"\n",
+    );
+    write(
+        &root.join("ws/inside"),
+        "Cargo.toml",
+        "[package]\nname = \"inside\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    write(
+        &root.join("ws/inside/src"),
+        "lib.rs",
+        "pub fn inside_fn() {}\n",
+    );
+    write(
+        &root.join("outside"),
+        "Cargo.toml",
+        "[package]\nname = \"outside\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
+         workspace = \"../ws\"\n",
+    );
+    write(
+        &root.join("outside/src"),
+        "lib.rs",
+        "pub fn outside_fn() {}\n",
+    );
+    // When I run `cargo crap --workspace --format json` from ws/
+    let json = json_in(&root.join("ws"), &["--workspace"]);
+    // Then the entries for `outside` carry its absolute file path
+    let outside = root.join("outside/src/lib.rs");
+    assert_eq!(
+        entry_files(&json),
+        [
+            slashes(outside.to_str().expect("utf-8")),
+            "inside/src/lib.rs".to_owned()
+        ]
+    );
+}
+
+#[test]
+fn single_path_mode_keeps_the_path_form_path_gave() {
+    // Given a crate with functions in src/lib.rs
+    let dir = spec40_crate(&[]);
+    // When I run `cargo crap --lcov lcov.info --format json` with the default --path
+    write(
+        dir.path(),
+        "lcov.info",
+        "SF:src/lib.rs\nDA:1,1\nend_of_record\n",
+    );
+    let json = json_in(dir.path(), &["--lcov", "lcov.info"]);
+    // Then every entries[].file starts with "./src/"
+    assert_eq!(entry_files(&json), ["./src/lib.rs"]);
+}
+
+#[test]
+fn coverage_is_matched_as_before() {
+    // Given the workspace, with alpha's functions fully covered in lcov.info
+    let ws = spec41_workspace();
+    // When I run `cargo crap --workspace --lcov lcov.info --format json`
+    let json = json_in(ws.path(), &["--workspace", "--lcov", "lcov.info"]);
+    // Then every alpha entry reports coverage 100
+    let alpha: Vec<&serde_json::Value> = json["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .filter(|e| {
+            e["function"]
+                .as_str()
+                .is_some_and(|f| f.starts_with("alpha"))
+        })
+        .collect();
+    assert!(!alpha.is_empty(), "{json}");
+    assert!(alpha.iter().all(|e| e["coverage"] == 100.0), "{alpha:?}");
+}
+
+// ---- Spec 41 · T4 ----
+
+/// The spec 41 workspace with a duplicate pair across alpha and beta. Both
+/// functions are named `dup`, so the duplicate delta can only pair them by
+/// path, never by a name unique to one side.
+fn spec41_workspace_with_duplicates() -> TempDir {
+    let ws = spec41_workspace();
+    write(
+        &ws.path().join("crates/alpha/src"),
+        "dup.rs",
+        &spec40_duplicate("dup"),
+    );
+    write(
+        &ws.path().join("crates/beta/src"),
+        "dup.rs",
+        &spec40_duplicate("dup"),
+    );
+    ws
+}
+
+/// Assert `delta` compared every function as unchanged and found no new
+/// duplicate group.
+fn assert_nothing_changed(delta: &serde_json::Value) {
+    let statuses = strings_at(&delta["entries"], "status");
+    assert!(!statuses.is_empty(), "{delta}");
+    assert!(statuses.iter().all(|s| s == "unchanged"), "{statuses:?}");
+    assert_eq!(
+        strings_at(&delta["removed"], "function"),
+        Vec::<String>::new()
+    );
+    let groups = strings_at(&delta["duplicate_groups"], "status");
+    assert!(!groups.is_empty(), "{delta}");
+    assert!(groups.iter().all(|s| s == "unchanged"), "{groups:?}");
+}
+
+#[test]
+fn an_absolute_baseline_from_the_same_checkout_compares_unchanged() {
+    // Given a baseline written by cargo-crap 0.8.0 with `--workspace --format json
+    // --duplicates` in this checkout
+    let ws = spec41_workspace_with_duplicates();
+    // Both runs start in the resolved spelling of the checkout, as 0.8.0
+    // wrote it: on Windows `TEMP` is an 8.3 short path (`RUNNER~1`), and a
+    // run started there reports short member paths the baseline must match.
+    let root = os_path(ws.path());
+    let mut baseline = json_in(
+        &root,
+        &["--workspace", "--lcov", "lcov.info", "--duplicates"],
+    );
+    let absolute = |v: &mut serde_json::Value| {
+        let rel = v.as_str().expect("a path").to_owned();
+        *v = root.join(rel).to_str().expect("utf-8").into();
+    };
+    for entry in baseline["entries"].as_array_mut().expect("entries") {
+        absolute(&mut entry["file"]);
+    }
+    for group in baseline["duplicate_groups"].as_array_mut().expect("groups") {
+        for member in group["members"].as_array_mut().expect("members") {
+            absolute(&mut member["file"]);
+        }
+    }
+    fs::write(ws.path().join("baseline.json"), baseline.to_string()).expect("write");
+    // And no source change since
+    // When I run `cargo crap --workspace --lcov lcov.info --duplicates --baseline baseline.json`
+    let delta = json_in(
+        &root,
+        &[
+            "--workspace",
+            "--lcov",
+            "lcov.info",
+            "--duplicates",
+            "--baseline",
+            "baseline.json",
+        ],
+    );
+    // Then every entry is Unchanged
+    // And none is New, Moved or removed
+    // And no duplicate group is reported as new
+    assert_nothing_changed(&delta);
+}
+
+#[test]
+fn a_relative_baseline_from_another_checkout_compares_unchanged() {
+    // Given a baseline written with `--workspace --format json --duplicates` in a
+    // copy of the workspace at another absolute path
+    let other = spec41_workspace_with_duplicates();
+    let baseline = json_in(
+        other.path(),
+        &["--workspace", "--lcov", "lcov.info", "--duplicates"],
+    );
+    // And the same source in this checkout
+    let ws = spec41_workspace_with_duplicates();
+    fs::write(ws.path().join("baseline.json"), baseline.to_string()).expect("write");
+    // When I run `cargo crap --workspace --lcov lcov.info --duplicates --baseline baseline.json`
+    let delta = json_in(
+        ws.path(),
+        &[
+            "--workspace",
+            "--lcov",
+            "lcov.info",
+            "--duplicates",
+            "--baseline",
+            "baseline.json",
+        ],
+    );
+    // Then every entry is Unchanged
+    // And none is New, Moved or removed
+    // And no duplicate group is reported as new
+    assert_nothing_changed(&delta);
+}
+
+#[test]
+fn the_baseline_exclude_filter_applies_to_relative_baseline_paths() {
+    // Given a baseline written with `--workspace --no-default-excludes --format json`
+    // that includes functions in crates/alpha/tests/
+    let ws = spec41_workspace();
+    let baseline = json_in(ws.path(), &["--workspace", "--no-default-excludes"]);
+    let files = strings_at(&baseline["entries"], "file");
+    assert!(
+        files
+            .iter()
+            .any(|f| slashes(f).starts_with("crates/alpha/tests/")),
+        "{files:?}"
+    );
+    fs::write(ws.path().join("baseline.json"), baseline.to_string()).expect("write");
+    // When I run `cargo crap --workspace --lcov lcov.info --baseline baseline.json`
+    let delta = json_in(
+        ws.path(),
+        &[
+            "--workspace",
+            "--lcov",
+            "lcov.info",
+            "--baseline",
+            "baseline.json",
+        ],
+    );
+    // Then no function from crates/alpha/tests/ is reported as removed
+    assert_eq!(strings_at(&delta["removed"], "file"), Vec::<String>::new());
+}
+
+#[test]
+fn the_p_member_scope_applies_to_relative_baseline_paths() {
+    // Given a baseline written with `--workspace --format json`
+    let ws = spec41_workspace();
+    let baseline = json_in(ws.path(), &["--workspace"]);
+    fs::write(ws.path().join("baseline.json"), baseline.to_string()).expect("write");
+    // When I run `cargo crap -p alpha --lcov lcov.info --baseline baseline.json`
+    let delta = json_in(
+        ws.path(),
+        &[
+            "-p",
+            "alpha",
+            "--lcov",
+            "lcov.info",
+            "--baseline",
+            "baseline.json",
+        ],
+    );
+    // Then no function from crates/beta/ is reported as removed
+    assert_eq!(strings_at(&delta["removed"], "file"), Vec::<String>::new());
+}
+
 // --- Spec 30 · Duplicate-pair triage ----------------------------------------
 //
 // Each task fills only its own heading, so parallel branches never touch the

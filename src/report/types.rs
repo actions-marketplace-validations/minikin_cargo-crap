@@ -28,7 +28,38 @@ pub fn set_color_enabled(enabled: bool) {
 }
 
 pub(crate) fn color_enabled() -> bool {
-    COLOR_ENABLED.load(Ordering::Relaxed)
+    color_override().unwrap_or_else(|| COLOR_ENABLED.load(Ordering::Relaxed))
+}
+
+#[cfg(not(test))]
+fn color_override() -> Option<bool> {
+    None
+}
+
+#[cfg(test)]
+fn color_override() -> Option<bool> {
+    COLOR_OVERRIDE.with(std::cell::Cell::get)
+}
+
+// `cargo test` runs every test of a crate in one process, one thread each.
+// A test that flipped `COLOR_ENABLED` would colour whatever another test
+// rendered meanwhile; an override on the test's own thread cannot.
+#[cfg(test)]
+thread_local! {
+    static COLOR_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Run `f` with colour switched to `enabled` on this thread only, for a test
+/// that needs to see both renderings.
+#[cfg(test)]
+pub(crate) fn with_color<T>(
+    enabled: bool,
+    f: impl FnOnce() -> T,
+) -> T {
+    let before = COLOR_OVERRIDE.with(|o| o.replace(Some(enabled)));
+    let out = f();
+    COLOR_OVERRIDE.with(|o| o.set(before));
+    out
 }
 
 /// Apply `style` to `text` only when colour is enabled, so escape codes
@@ -332,6 +363,27 @@ pub(crate) fn write_truncation_footer(
     Ok(())
 }
 
+/// `path` as a workspace-mode report writes it (spec 41): below `root` when
+/// it is inside it, else as given. Workspace-mode paths are absolute, as
+/// `cargo metadata` reports the members, and for an absolute `path` joining
+/// the result to `root` gives `path` back. `None` (single-path mode) writes
+/// every path as given.
+pub(crate) fn workspace_relative<'a>(
+    path: &'a Path,
+    root: Option<&Path>,
+) -> &'a Path {
+    root.map_or(path, |root| cwd_relative(path, root))
+}
+
+/// [`workspace_relative`] below a known `root`, owned, for building the
+/// copy of a report a workspace-mode renderer writes.
+pub(crate) fn below_root(
+    path: &Path,
+    root: &Path,
+) -> std::path::PathBuf {
+    workspace_relative(path, Some(root)).to_path_buf()
+}
+
 /// `path` relative to `cwd` when it is under it, else `path` as given.
 pub(crate) fn cwd_relative<'a>(
     path: &'a Path,
@@ -423,6 +475,75 @@ pub(crate) fn format_location_with_prev(
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn a_path_inside_the_workspace_root_is_written_below_it() {
+        let root = Path::new("/ws");
+        assert_eq!(
+            workspace_relative(Path::new("/ws/crates/a/src/lib.rs"), Some(root)),
+            Path::new("crates/a/src/lib.rs")
+        );
+    }
+
+    #[test]
+    fn a_path_outside_the_workspace_root_is_written_as_given() {
+        let path = Path::new("/elsewhere/src/lib.rs");
+        assert_eq!(workspace_relative(path, Some(Path::new("/ws"))), path);
+    }
+
+    #[test]
+    fn the_workspace_root_itself_is_written_empty() {
+        assert_eq!(
+            workspace_relative(Path::new("/ws"), Some(Path::new("/ws"))),
+            Path::new("")
+        );
+    }
+
+    #[test]
+    fn without_a_workspace_root_every_path_is_written_as_given() {
+        let path = Path::new("/ws/src/lib.rs");
+        assert_eq!(workspace_relative(path, None), path);
+    }
+
+    proptest! {
+        #[test]
+        fn a_written_path_resolves_back_to_the_analysed_file(
+            root in prop::collection::vec("[a-z]{1,4}", 1..3),
+            below in prop::collection::vec("[a-z]{1,4}", 1..4),
+            inside in any::<bool>(),
+        ) {
+            let root = Path::new("/").join(root.join("/"));
+            let file = if inside {
+                root.join(below.join("/"))
+            } else {
+                Path::new("/elsewhere").join(below.join("/"))
+            };
+            let written = workspace_relative(&file, Some(&root));
+            prop_assert_eq!(root.join(written), file);
+        }
+    }
+
+    #[test]
+    fn colour_switched_on_by_a_test_is_not_seen_by_a_test_on_another_thread() {
+        use std::sync::Barrier;
+        let switched = Barrier::new(2);
+        let checked = Barrier::new(2);
+        let seen_elsewhere = std::thread::scope(|s| {
+            s.spawn(|| {
+                with_color(true, || {
+                    switched.wait();
+                    checked.wait();
+                });
+            });
+            switched.wait();
+            let seen = color_enabled();
+            checked.wait();
+            seen
+        });
+        assert!(!seen_elsewhere);
+        assert!(with_color(true, color_enabled));
+        assert!(!color_enabled());
+    }
 
     #[test]
     fn cc_display_shows_integral_cc_without_a_decimal_point() {
