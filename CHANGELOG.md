@@ -8,6 +8,85 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A delta run with `--duplicates` pairs a function with its baseline
+  record when the two runs see the file under different roots: an
+  absolute baseline from another checkout, `./src/a.rs` against
+  `/app/src/a.rs`, or another `--path` spelling. Same-named functions,
+  such as two copies of `dup`, used to be reported as new duplicates;
+  now a function pairs with the same-named one whose file shares the
+  longest path suffix, as the CRAP delta already did (spec 21). This
+  narrows the 0.9.0 migration note: an absolute baseline from another
+  checkout no longer needs re-recording for the duplicate comparison,
+  only for the baseline exclude filter and `-p` scoping, which still
+  expect one root (spec 42).
+
+
+## [0.9.0] - 2026-10-17
+
+In a Cargo workspace, `exclude` globs now also match paths relative to the
+workspace root, so `exclude = ["agent/**"]` in a root `.cargo-crap.toml`
+drops a whole member, and a command-line `--exclude` that matches no file
+says so instead of silently doing nothing. Reports in `--workspace` and
+`-p` mode write paths relative to the workspace root in every format
+rather than the runner's absolute checkout path. JSON and SARIF paths
+change form, so consumers that parse them, and library consumers of
+`RenderOptions` and `complexity::analyze_tree_cached`, need to read
+Changed and the migration note below.
+
+### Added
+
+- An `--exclude` glob that excludes no file prints a warning naming the
+  base globs are matched against. Config `exclude` globs and the default
+  exclusions never warn, and the exit code does not change (spec 40).
+
+### Changed
+
+- In `--workspace` and `-p` mode, `exclude` and `--exclude` globs also
+  match a file's path below the workspace root, so `exclude = ["agent/**"]`
+  in a root `.cargo-crap.toml` drops that member. Member-relative globs
+  such as `src/generated/**` work as before, and the default exclusions
+  still match below each member only. The duplicate scan and the baseline
+  filter follow the same rule (spec 40).
+- In `--workspace` and `-p` mode, reports write paths relative to the
+  workspace root instead of absolute: the human table, markdown, the PR
+  comment, both duplicate sections, JSON (`file`, `previous_file`,
+  `duplicates[].first_file` / `second_file`, duplicate group members and
+  the analyzed-file examples under `diagnostics`) and SARIF `uri`. A
+  member outside the workspace root keeps its absolute path, single-path
+  mode is unchanged, and link URLs and GitHub annotations are as before.
+  A workspace-mode `--baseline` reads relative paths against the
+  workspace root, so a baseline compares cleanly across checkouts, and an
+  absolute baseline from an earlier version still compares cleanly in the
+  checkout that recorded it (spec 41).
+- **BREAKING (library API):** `RenderOptions` gains `workspace_root`, and
+  `SourceLinks::with_workspace_root` is new (spec 41).
+- **BREAKING (library API):** `complexity::analyze_tree_cached` takes a
+  `complexity::ExcludeMatcher` and returns `CachedAnalysis` directly.
+  `ExcludeMatcher`, `Exclusion`, `complexity::rust_files_matching`,
+  `complexity::analyze_tree_matching` and `duplicates::scan::scan_matching`
+  are new; the `&[S]` entry points are unchanged (spec 40).
+
+### Migrating from 0.8.x
+
+- An absolute baseline recorded by 0.8.x still compares cleanly only in
+  the checkout that recorded it. To compare across checkouts (CI against a
+  developer machine, or two worktrees), re-record the baseline with 0.9.0:
+  its paths are relative to the workspace root and resolve anywhere.
+- Absolute paths in `exclude` / `--exclude` globs are not supported. Write
+  them relative to the workspace root (`agent/**`) or to each member
+  (`src/generated/**`); a command-line glob that matches nothing now warns.
+- Tools that read `file` (or `uri`) from workspace-mode JSON or SARIF as an
+  absolute path must join it to the workspace root first. Single-path runs
+  are unchanged.
+
+### Internal
+
+- A colour test switched the process-wide colour flag while the human
+  width property ran beside it under `cargo test`, failing it at random.
+  Tests now switch colour on their own thread only.
+
 
 ## [0.8.0] - 2026-10-14
 
@@ -872,7 +951,8 @@ output points at v2.
 
 <!-- Version links -->
 
-[Unreleased]: https://github.com/minikin/cargo-crap/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/minikin/cargo-crap/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/minikin/cargo-crap/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/minikin/cargo-crap/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/minikin/cargo-crap/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/minikin/cargo-crap/compare/v0.6.0...v0.6.1

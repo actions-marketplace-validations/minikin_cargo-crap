@@ -83,9 +83,11 @@ struct Cli {
     )]
     package: Vec<String>,
 
-    /// Glob patterns for files to skip (relative to `--path`).
+    /// Glob patterns for files to skip, relative to `--path`, or in workspace
+    /// mode to each member's directory or the workspace root.
     /// Use `**` to cross directory boundaries. May be repeated.
     /// Appends to the default exclusions (see `--no-default-excludes`).
+    /// A glob that excludes no file gets a warning.
     ///
     /// Examples: `--exclude 'src/generated/**'`  `--exclude '**/build.rs'`
     #[arg(long, value_name = "GLOB")]
@@ -297,25 +299,95 @@ impl From<FormatArg> for Format {
 /// `--no-default-excludes`.
 const DEFAULT_EXCLUDES: &[&str] = &["tests/**", "benches/**", "examples/**"];
 
-/// Assemble the effective exclude list (spec 14 precedence): the default
-/// list (built-in, or replaced by `default-excludes`, or emptied by
-/// `--no-default-excludes`), followed by config and CLI `exclude` globs,
-/// which always append and never replace.
+/// A run's exclude globs, kept apart by how they match (spec 40): the
+/// defaults only ever below each walked root, the user's also below the
+/// workspace root in workspace mode.
+#[derive(Debug, Clone, Default)]
+struct Excludes {
+    defaults: Vec<String>,
+    /// Config `exclude`, then `--exclude`.
+    user: Vec<String>,
+    /// Where the `--exclude` globs start in `user`: the only ones a no-match
+    /// warning names (spec 40).
+    cli_start: usize,
+}
+
+/// Assemble the effective excludes (spec 14 precedence): the default list
+/// (built-in, or replaced by `default-excludes`, or emptied by
+/// `--no-default-excludes`), and the config and CLI `exclude` globs, which
+/// always add to it and never replace it.
 fn effective_excludes(
     no_default_excludes: bool,
     config_default_excludes: Option<Vec<String>>,
     config_exclude: Vec<String>,
     cli_exclude: Vec<String>,
-) -> Vec<String> {
-    let mut out = if no_default_excludes {
+) -> Excludes {
+    let defaults = if no_default_excludes {
         Vec::new()
     } else {
         config_default_excludes
             .unwrap_or_else(|| DEFAULT_EXCLUDES.iter().map(ToString::to_string).collect())
     };
-    out.extend(config_exclude);
-    out.extend(cli_exclude);
-    out
+    let cli_start = config_exclude.len();
+    let mut user = config_exclude;
+    user.extend(cli_exclude);
+    Excludes {
+        defaults,
+        user,
+        cli_start,
+    }
+}
+
+/// The `--exclude` globs that `matched` (one flag per `excludes.user`
+/// glob) says excluded no file in the run.
+fn unmatched_cli_excludes<'a>(
+    excludes: &'a Excludes,
+    matched: &[bool],
+) -> Vec<&'a str> {
+    debug_assert_eq!(excludes.user.len(), matched.len());
+    let mut unmatched: Vec<&str> = Vec::new();
+    for (glob, _) in excludes
+        .user
+        .iter()
+        .zip(matched)
+        .skip(excludes.cli_start)
+        .filter(|(_, hit)| !**hit)
+    {
+        if !unmatched.contains(&glob.as_str()) {
+            unmatched.push(glob);
+        }
+    }
+    unmatched
+}
+
+/// The workspace root in `--workspace` and `-p` mode, as every walked root
+/// records it; `None` in single-path mode.
+fn workspace_root(roots: &[ScanRoot]) -> Option<&Path> {
+    roots.iter().find_map(|r| r.workspace_root.as_deref())
+}
+
+/// One stderr warning per `--exclude` glob the walk never matched (spec 40).
+fn warn_unmatched_excludes(
+    excludes: &Excludes,
+    matched: &[bool],
+    roots: &[ScanRoot],
+) {
+    let workspace = workspace_root(roots).is_some();
+    for glob in unmatched_cli_excludes(excludes, matched) {
+        eprintln!("{}", no_match_warning(glob, workspace));
+    }
+}
+
+fn no_match_warning(
+    glob: &str,
+    workspace: bool,
+) -> String {
+    let base = if workspace {
+        "each member's directory or the workspace root"
+    } else {
+        "`--path`"
+    };
+    format!("warning: --exclude '{glob}' excluded no file; globs are relative to {base}")
 }
 
 /// Strip the leading `crap` token inserted by cargo when invoked as a subcommand.
@@ -412,7 +484,41 @@ struct WorkspaceMember {
 #[derive(Debug, Clone)]
 struct ScanRoot {
     dir: PathBuf,
-    excludes: Vec<String>,
+    /// The defaults and the nested-member excludes: matched below `dir` only.
+    member_only: Vec<String>,
+    /// Config and CLI globs: matched below `dir` and below `workspace_root`.
+    user: Vec<String>,
+    /// `None` outside workspace mode, where `dir` is the only base.
+    workspace_root: Option<PathBuf>,
+}
+
+impl ScanRoot {
+    /// `dir` under the run's `excludes`, plus `nested` (other members' roots
+    /// below `dir`), which match below `dir` only, like the defaults.
+    fn new(
+        dir: PathBuf,
+        excludes: &Excludes,
+        nested: Vec<String>,
+        workspace_root: Option<PathBuf>,
+    ) -> Self {
+        let mut member_only = excludes.defaults.clone();
+        member_only.extend(nested);
+        Self {
+            dir,
+            member_only,
+            user: excludes.user.clone(),
+            workspace_root,
+        }
+    }
+
+    fn matcher(&self) -> Result<complexity::ExcludeMatcher> {
+        complexity::ExcludeMatcher::new(
+            &self.member_only,
+            &self.user,
+            self.workspace_root.as_deref(),
+        )
+        .with_context(|| format!("analyzing {}", self.dir.display()))
+    }
 }
 
 /// What [`analyze_sources`] hands back to `main`.
@@ -420,6 +526,9 @@ struct AnalyzedSources {
     fns: Vec<complexity::FunctionComplexity>,
     /// Every root walked, in order, with its effective excludes.
     roots: Vec<ScanRoot>,
+    /// One flag per user exclude glob: whether the complexity walk excluded
+    /// any file with it, in any root.
+    user_globs_matched: Vec<bool>,
     /// The analyzed workspace members: all of them under `--workspace`, the
     /// selected subset under `-p/--package`, empty for single-root runs.
     members: Vec<WorkspaceMember>,
@@ -443,7 +552,7 @@ fn analyze_sources(
     workspace: bool,
     packages: &[String],
     path: &std::path::Path,
-    excludes: &[String],
+    excludes: &Excludes,
     knobs: &AnalysisKnobs,
 ) -> Result<AnalyzedSources> {
     if let Some(n) = knobs.jobs {
@@ -453,13 +562,12 @@ fn analyze_sources(
             .with_context(|| format!("configuring rayon thread pool to {n} threads"))?;
     }
     if !workspace && packages.is_empty() {
-        let (fns, target) = analyze_path(path, excludes, knobs)?;
+        let root = ScanRoot::new(path.to_path_buf(), excludes, Vec::new(), None);
+        let (fns, user_globs_matched, target) = analyze_path(&root, knobs)?;
         return Ok(AnalyzedSources {
             fns,
-            roots: vec![ScanRoot {
-                dir: path.to_path_buf(),
-                excludes: excludes.to_vec(),
-            }],
+            roots: vec![root],
+            user_globs_matched,
             members: Vec::new(),
             member_scope: None,
             target,
@@ -472,10 +580,14 @@ fn analyze_sources(
 /// target directory to keep it in (spec 10). Without one, or when the
 /// running executable cannot be identified, the walk is uncached.
 fn analyze_path(
-    path: &Path,
-    excludes: &[String],
+    root: &ScanRoot,
     knobs: &AnalysisKnobs,
-) -> Result<(Vec<complexity::FunctionComplexity>, Option<PathBuf>)> {
+) -> Result<(
+    Vec<complexity::FunctionComplexity>,
+    Vec<bool>,
+    Option<PathBuf>,
+)> {
+    let path = &root.dir;
     let config_dir = knobs.config_dir.as_deref();
     let target = target_dir(None, path, config_dir, &knobs.cwd, |name| {
         std::env::var(name).ok()
@@ -485,36 +597,42 @@ fn analyze_path(
         .filter(|_| knobs.cache)
         .and_then(|target| Session::open(target, knobs.try_weight));
     let mut records = Vec::new();
-    let fns = analyze_root(
-        path,
-        excludes,
-        knobs.try_weight,
-        session.as_ref(),
-        &mut records,
-    )?;
+    let (fns, matched) = analyze_root(root, knobs.try_weight, session.as_ref(), &mut records)?;
     if let Some(session) = session {
-        session.save(&[path.to_path_buf()], records);
+        session.save(std::slice::from_ref(path), records);
     }
-    Ok((fns, target))
+    Ok((fns, matched, target))
 }
 
 /// Walk one root, through `session`'s cache when there is one, adding the
-/// records to store to `records`.
+/// records to store to `records`. Returns the functions and, per user glob,
+/// whether it excluded any file under this root.
 fn analyze_root(
-    dir: &Path,
-    excludes: &[String],
+    root: &ScanRoot,
     try_weight: f64,
     session: Option<&Session>,
     records: &mut Vec<FileRecord>,
-) -> Result<Vec<complexity::FunctionComplexity>> {
-    let context = || format!("analyzing {}", dir.display());
-    let Some(session) = session else {
-        return complexity::analyze_tree_weighted(dir, excludes, try_weight).with_context(context);
-    };
-    let analysis =
-        complexity::analyze_tree_cached(dir, excludes, session.cache()).with_context(context)?;
-    records.extend(analysis.records);
-    Ok(analysis.functions)
+) -> Result<(Vec<complexity::FunctionComplexity>, Vec<bool>)> {
+    let excludes = root.matcher()?;
+    let fns = session.map_or_else(
+        || complexity::analyze_tree_matching(&root.dir, &excludes, try_weight),
+        |session| {
+            let analysis = complexity::analyze_tree_cached(&root.dir, &excludes, session.cache());
+            records.extend(analysis.records);
+            analysis.functions
+        },
+    );
+    Ok((fns, excludes.user_globs_matched()))
+}
+
+/// Mark in `all` every user glob `root` says matched under one more root.
+fn add_matches(
+    all: &mut [bool],
+    root: &[bool],
+) {
+    for (any, &hit) in all.iter_mut().zip(root) {
+        *any |= hit;
+    }
 }
 
 /// The workspace side of [`analyze_sources`]: discover members, narrow to
@@ -522,7 +640,7 @@ fn analyze_root(
 /// walk each selected member's root.
 fn analyze_workspace_members(
     packages: &[String],
-    excludes: &[String],
+    excludes: &Excludes,
     knobs: &AnalysisKnobs,
 ) -> Result<AnalyzedSources> {
     let Workspace {
@@ -545,23 +663,21 @@ fn analyze_workspace_members(
     let mut records = Vec::new();
     let mut fns = Vec::new();
     let mut roots = Vec::new();
+    let mut user_globs_matched = vec![false; excludes.user.len()];
     for m in &members {
         // Nested exclusion is computed against every discovered member, not
         // just the selected ones: an unselected nested member's files must
         // not leak into its parent's walk either.
-        let mut walk_excludes = excludes.to_vec();
-        walk_excludes.extend(nested_member_excludes(&m.dir, &discovered));
-        fns.extend(analyze_root(
-            &m.dir,
-            &walk_excludes,
-            knobs.try_weight,
-            cache,
-            &mut records,
-        )?);
-        roots.push(ScanRoot {
-            dir: m.dir.clone(),
-            excludes: walk_excludes,
-        });
+        let root = ScanRoot::new(
+            m.dir.clone(),
+            excludes,
+            nested_member_excludes(&m.dir, &discovered),
+            Some(workspace_root.clone()),
+        );
+        let (member_fns, matched) = analyze_root(&root, knobs.try_weight, cache, &mut records)?;
+        fns.extend(member_fns);
+        add_matches(&mut user_globs_matched, &matched);
+        roots.push(root);
     }
     save_members(session, &discovered, &members, records);
     let member_scope =
@@ -569,6 +685,7 @@ fn analyze_workspace_members(
     Ok(AnalyzedSources {
         fns,
         roots,
+        user_globs_matched,
         members,
         member_scope,
         target: Some(target),
@@ -852,52 +969,54 @@ fn slice_of(
 /// leaves those stale entries eligible for the delta's pass-2 name matcher,
 /// which can pair them with unrelated new functions as phantom moves.
 struct BaselineFilter {
-    exclude_set: GlobSet,
+    /// Each analyzed root with the exclude matcher its walk used, sorted
+    /// longest-first so the deepest root claims the prefix — the same
+    /// longest-match rule as [`assign_crate_names`].
+    roots: Vec<(PathBuf, complexity::ExcludeMatcher)>,
     name_allow: GlobSet,
     path_allow: GlobSet,
-    /// Analyzed roots (workspace member dirs, or the single `--path` root),
-    /// sorted longest-first so the deepest root claims the prefix — the same
-    /// longest-match rule as [`assign_crate_names`].
-    roots: Vec<PathBuf>,
 }
 
 impl BaselineFilter {
     fn new(
-        excludes: &[String],
+        roots: &[ScanRoot],
         allow_patterns: &[String],
-        mut roots: Vec<PathBuf>,
     ) -> Result<Self> {
-        let exclude_pats: Vec<&str> = excludes.iter().map(String::as_str).collect();
         let (path_pats, name_pats): (Vec<&str>, Vec<&str>) = allow_patterns
             .iter()
             .map(String::as_str)
             .partition(|p| is_path_allow_pattern(p));
-        roots.sort_by_key(|r| std::cmp::Reverse(r.as_os_str().len()));
+        let mut roots = roots
+            .iter()
+            .map(|root| Ok((root.dir.clone(), root.matcher()?)))
+            .collect::<Result<Vec<_>>>()?;
+        roots.sort_by_key(|(dir, _)| std::cmp::Reverse(dir.as_os_str().len()));
         Ok(Self {
-            exclude_set: build_path_set(&exclude_pats, "exclude")?,
+            roots,
             name_allow: build_allow_set(&name_pats)?,
             path_allow: build_path_set(&path_pats, "allow")?,
-            roots,
         })
     }
 
-    /// True when the exclude globs match `file` once it is normalized to
-    /// forward slashes (cross-platform baselines) and stripped of the
-    /// deepest analyzed-root prefix (excludes are root-relative).
+    /// True when the walk would have excluded `file`, normalized to forward
+    /// slashes (cross-platform baselines): matched by the deepest analyzed
+    /// root's matcher. A path under no root is matched whole.
     fn is_excluded(
         &self,
         file: &Path,
     ) -> bool {
-        if self.exclude_set.is_empty() {
-            return false;
-        }
         let normalized = PathBuf::from(file.to_string_lossy().replace('\\', "/"));
-        let rel = self
+        let owner = self
             .roots
             .iter()
-            .find_map(|root| normalized.strip_prefix(root).ok())
-            .unwrap_or(&normalized);
-        self.exclude_set.is_match(rel)
+            .find(|(dir, _)| normalized.starts_with(dir))
+            .map(|(dir, excludes)| (dir.as_path(), excludes))
+            .or_else(|| {
+                self.roots
+                    .last()
+                    .map(|(_, excludes)| (Path::new(""), excludes))
+            });
+        owner.is_some_and(|(dir, excludes)| excludes.check(dir, &normalized).excluded)
     }
 
     /// Drop every duplicate group member the current run's duplicate scan
@@ -1329,10 +1448,8 @@ fn effective_summary(
 /// proceeds.
 fn load_filtered_baseline(
     baseline: Option<&PathBuf>,
-    excludes: &[String],
     allow_patterns: &[String],
-    path: &Path,
-    members: &[WorkspaceMember],
+    roots: &[ScanRoot],
     member_scope: Option<&MemberScope>,
     try_weight: f64,
 ) -> Result<Option<Baseline>> {
@@ -1342,12 +1459,8 @@ fn load_filtered_baseline(
     let baseline = load_baseline_with_weight(baseline_path)?;
     warn_on_try_weight_mismatch(baseline.try_weight, try_weight);
     let mut baseline = baseline;
-    let roots = if members.is_empty() {
-        vec![path.to_path_buf()]
-    } else {
-        members.iter().map(|m| m.dir.clone()).collect()
-    };
-    let filter = BaselineFilter::new(excludes, allow_patterns, roots)?;
+    resolve_relative_paths(&mut baseline, workspace_root(roots));
+    let filter = BaselineFilter::new(roots, allow_patterns)?;
     filter.retain(&mut baseline.entries);
     apply_member_scope(&mut baseline.entries, member_scope);
     // At most one record: `for_each` filters it when the baseline has one.
@@ -1356,6 +1469,27 @@ fn load_filtered_baseline(
         .iter_mut()
         .for_each(|groups| filter_duplicate_record(groups, &filter, member_scope));
     Ok(Some(baseline))
+}
+
+/// In workspace mode, read every relative path in `baseline` as relative to
+/// the workspace root, as a workspace-mode report writes it (spec 41), so the
+/// filter, the member scope and the delta compare absolute with absolute.
+fn resolve_relative_paths(
+    baseline: &mut Baseline,
+    workspace_root: Option<&Path>,
+) {
+    let Some(root) = workspace_root else {
+        return;
+    };
+    // `join` keeps an absolute path as it is. Separators are unified first,
+    // as `BaselineFilter` does, so a baseline written on Windows resolves.
+    let resolve = |file: &mut PathBuf| *file = root.join(file.to_string_lossy().replace('\\', "/"));
+    for entry in &mut baseline.entries {
+        resolve(&mut entry.file);
+    }
+    for member in baseline.duplicate_groups.iter_mut().flatten().flatten() {
+        resolve(&mut member.file);
+    }
 }
 
 fn warn_on_try_weight_mismatch(
@@ -1526,7 +1660,7 @@ fn duplicate_pairs(
     }
     let mut functions = Vec::new();
     for root in roots {
-        functions.extend(duplicates::scan::scan(&root.dir, &root.excludes)?);
+        functions.extend(duplicates::scan::scan_matching(&root.dir, &root.matcher()?));
     }
     // Small functions are dropped before comparison rather than filtered out
     // of the results: every pair of trivial accessors is a genuine structural
@@ -1567,6 +1701,20 @@ impl DuplicateSection<'_> {
             provider: self.provider,
             model: self.model,
         })
+    }
+
+    /// Render options carrying this section, every other field at its
+    /// default.
+    fn render_options(&self) -> RenderOptions<'_> {
+        RenderOptions {
+            duplicates: self.pairs.as_deref(),
+            groups: self.groups.as_deref(),
+            triage: self.triage.as_deref(),
+            triaged_by: self.triaged_by(),
+            novelty: self.novelty.as_ref(),
+            untriaged: self.untriaged,
+            ..RenderOptions::default()
+        }
     }
 }
 
@@ -1791,6 +1939,7 @@ fn resolve_source_links(
     cli_repo_url: Option<String>,
     cli_commit_ref: Option<String>,
     root: &Path,
+    workspace_root: Option<&Path>,
 ) -> Option<SourceLinks> {
     let repo_url = cli_repo_url.or_else(|| {
         let server = std::env::var("GITHUB_SERVER_URL").ok()?;
@@ -1802,7 +1951,10 @@ fn resolve_source_links(
         ))
     })?;
     let commit_ref = cli_commit_ref.or_else(|| std::env::var("GITHUB_SHA").ok())?;
-    Some(SourceLinks::new(repo_url, commit_ref).with_root(root.to_path_buf()))
+    let links = SourceLinks::new(repo_url, commit_ref).with_root(root.to_path_buf());
+    Some(workspace_root.map_or(links.clone(), |workspace_root| {
+        links.with_workspace_root(workspace_root.to_path_buf())
+    }))
 }
 
 /// Parse argv, validate flag combinations, and load the optional
@@ -1917,6 +2069,42 @@ fn parse_and_validate() -> Result<LoadedArgs> {
     })
 }
 
+/// The settings `run` reads with CLI values taking precedence and config
+/// filling in what is missing.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each bool is one resolved CLI/config switch; not a struct-design smell"
+)]
+struct Settings {
+    threshold: f64,
+    missing_policy: MissingCoveragePolicy,
+    fail_above: bool,
+    fail_regression: bool,
+    show_unchanged: bool,
+    uncovered_hints: bool,
+    sort_order: SortOrder,
+}
+
+fn resolve_settings(
+    cli: &Cli,
+    config: &cargo_crap::config::Config,
+) -> Settings {
+    Settings {
+        threshold: cli
+            .threshold
+            .or(config.threshold)
+            .unwrap_or(DEFAULT_THRESHOLD),
+        missing_policy: resolve_missing(cli.missing, config.missing),
+        fail_above: resolve_bool(cli.fail_above, config.fail_above),
+        fail_regression: resolve_bool(cli.fail_regression, config.fail_regression),
+        show_unchanged: resolve_bool(cli.show_unchanged, config.show_unchanged),
+        // Config-only knob: deliberately no CLI flag, so there is no CLI side
+        // to resolve against.
+        uncovered_hints: config.uncovered_hints.unwrap_or(false),
+        sort_order: cli.sort.map(Into::into).or(config.sort).unwrap_or_default(),
+    }
+}
+
 fn run() -> Result<ExitCode> {
     let LoadedArgs {
         cli,
@@ -1926,22 +2114,7 @@ fn run() -> Result<ExitCode> {
         knobs,
     } = parse_and_validate()?;
     let try_weight = knobs.try_weight;
-
-    // Merge: CLI values take precedence; config fills in what's missing.
-    let threshold = cli
-        .threshold
-        .or(config.threshold)
-        .unwrap_or(DEFAULT_THRESHOLD);
-
-    let missing_policy = resolve_missing(cli.missing, config.missing);
-
-    let fail_above = resolve_bool(cli.fail_above, config.fail_above);
-    let fail_regression = resolve_bool(cli.fail_regression, config.fail_regression);
-    let show_unchanged = resolve_bool(cli.show_unchanged, config.show_unchanged);
-    // Config-only knob: deliberately no CLI flag, so there is no CLI side
-    // to resolve against.
-    let uncovered_hints = config.uncovered_hints.unwrap_or(false);
-    let sort_order = cli.sort.map(Into::into).or(config.sort).unwrap_or_default();
+    let settings = resolve_settings(&cli, &config);
 
     let effective_exclude = effective_excludes(
         cli.no_default_excludes,
@@ -1957,6 +2130,7 @@ fn run() -> Result<ExitCode> {
     let AnalyzedSources {
         fns,
         roots,
+        user_globs_matched,
         members,
         member_scope,
         target,
@@ -1969,11 +2143,12 @@ fn run() -> Result<ExitCode> {
     )?;
 
     pb.set_message("Parsing coverage report…");
+    pb.suspend(|| warn_unmatched_excludes(&effective_exclude, &user_globs_matched, &roots));
     let coverage = load_coverage(cli.lcov.as_ref())?;
     pb.finish_and_clear();
 
     // --- Merge + filters ---
-    let merge_result = merge(fns, coverage, missing_policy);
+    let merge_result = merge(fns, coverage, settings.missing_policy);
     let diagnostics = merge_result.diagnostics;
     warn_scope_mismatch(diagnostics.as_ref());
     let mut entries = merge_result.entries;
@@ -1982,47 +2157,46 @@ fn run() -> Result<ExitCode> {
     apply_filters(&mut entries, &effective_allow)?;
     // `entries` stays whole for the baseline comparison. `sliced_rows` holds
     // the rows `min` and `top` select, ordered after `top` has picked by CRAP.
-    let sliced_rows = shown_rows(&mut entries, min, top, sort_order);
+    let sliced_rows = shown_rows(&mut entries, min, top, settings.sort_order);
 
     // --- Baseline (loaded here, filtered per specs 18 + 25) ---
     let baseline_data = load_filtered_baseline(
         cli.baseline.as_ref(),
-        &effective_exclude,
         &effective_allow,
-        &cli.path,
-        &members,
+        &roots,
         member_scope.as_ref(),
         try_weight,
     )?;
 
     // --- Render ---
     let mut out_box = prepare_output(cli.output.as_ref())?;
-    let links = resolve_source_links(cli.repo_url, cli.commit_ref, &knobs.cwd);
+    let workspace_root = workspace_root(&roots).map(Path::to_path_buf);
+    let links = resolve_source_links(
+        cli.repo_url,
+        cli.commit_ref,
+        &knobs.cwd,
+        workspace_root.as_deref(),
+    );
     let baseline = baseline_data.as_ref();
     let dups = duplicate_section(&dup, &roots, cli.format.into(), target.as_deref(), baseline)?;
     let opts = RenderOpts {
         render: RenderOptions {
-            threshold,
+            threshold: settings.threshold,
             format: cli.format.into(),
             links: links.as_ref(),
             diagnostics: diagnostics.as_ref(),
-            show_unchanged,
-            uncovered_hints,
+            show_unchanged: settings.show_unchanged,
+            uncovered_hints: settings.uncovered_hints,
             try_weight,
             sliced: is_sliced(min, top),
-            delta_counts: None,
             width: output_width(cli.output.is_none()),
             cwd: &knobs.cwd,
-            duplicates: dups.pairs.as_deref(),
-            groups: dups.groups.as_deref(),
-            triage: dups.triage.as_deref(),
-            triaged_by: dups.triaged_by(),
-            novelty: dups.novelty.as_ref(),
-            untriaged: dups.untriaged,
+            workspace_root: workspace_root.as_deref(),
+            ..dups.render_options()
         },
         epsilon,
         summary: cli.summary,
-        sort: sort_order,
+        sort: settings.sort_order,
     };
     let (has_crappy, has_regression) = do_render(
         sliced_rows.as_deref().unwrap_or(&entries),
@@ -2036,7 +2210,7 @@ fn run() -> Result<ExitCode> {
     // truncated report (#47, spec 23).
     out_box.flush().context("flushing output")?;
 
-    if (fail_above && has_crappy) || (fail_regression && has_regression) {
+    if (settings.fail_above && has_crappy) || (settings.fail_regression && has_regression) {
         return Ok(ExitCode::from(1));
     }
     Ok(ExitCode::SUCCESS)
@@ -2740,9 +2914,65 @@ mod tests {
     }
 
     #[test]
+    fn effective_excludes_keep_user_globs_apart_from_the_defaults() {
+        let out = effective_excludes(
+            false,
+            Some(strs(&["benches/**"])),
+            strs(&["src/legacy/**"]),
+            strs(&["src/generated/**"]),
+        );
+        assert_eq!(out.defaults, strs(&["benches/**"]));
+        assert_eq!(out.user, strs(&["src/legacy/**", "src/generated/**"]));
+        assert_eq!(out.cli_start, 1, "the CLI globs follow the config ones");
+    }
+
+    #[test]
+    fn only_command_line_globs_that_matched_nothing_are_unmatched() {
+        let excludes = Excludes {
+            defaults: strs(&["tests/**"]),
+            user: strs(&["config/**", "hit/**", "miss/**"]),
+            cli_start: 1,
+        };
+        assert_eq!(
+            unmatched_cli_excludes(&excludes, &[false, true, false]),
+            ["miss/**"]
+        );
+        assert_eq!(
+            unmatched_cli_excludes(&excludes, &[false, false, true]),
+            ["hit/**"]
+        );
+    }
+
+    #[test]
+    fn a_command_line_glob_given_twice_is_unmatched_once() {
+        let excludes = Excludes {
+            defaults: Vec::new(),
+            user: strs(&["miss/**", "miss/**"]),
+            cli_start: 0,
+        };
+        assert_eq!(
+            unmatched_cli_excludes(&excludes, &[false, false]),
+            ["miss/**"]
+        );
+    }
+
+    #[test]
+    fn the_no_match_warning_names_the_base_of_the_mode() {
+        assert_eq!(
+            no_match_warning("x/**", false),
+            "warning: --exclude 'x/**' excluded no file; globs are relative to `--path`"
+        );
+        assert_eq!(
+            no_match_warning("x/**", true),
+            "warning: --exclude 'x/**' excluded no file; globs are relative to \
+             each member's directory or the workspace root"
+        );
+    }
+
+    #[test]
     fn effective_excludes_defaults_to_builtin_list() {
         let out = effective_excludes(false, None, vec![], vec![]);
-        assert_eq!(out, strs(&["tests/**", "benches/**", "examples/**"]));
+        assert_eq!(flat(&out), strs(&["tests/**", "benches/**", "examples/**"]));
     }
 
     #[test]
@@ -2753,19 +2983,19 @@ mod tests {
             vec![],
             vec![],
         );
-        assert_eq!(out, strs(&["benches/**", "examples/**"]));
+        assert_eq!(flat(&out), strs(&["benches/**", "examples/**"]));
     }
 
     #[test]
     fn effective_excludes_empty_config_list_disables_defaults() {
         let out = effective_excludes(false, Some(vec![]), vec![], vec![]);
-        assert_eq!(out, Vec::<String>::new());
+        assert_eq!(flat(&out), Vec::<String>::new());
     }
 
     #[test]
     fn effective_excludes_flag_overrides_config_replacement() {
         let out = effective_excludes(true, Some(strs(&["tests/**"])), vec![], vec![]);
-        assert_eq!(out, Vec::<String>::new());
+        assert_eq!(flat(&out), Vec::<String>::new());
     }
 
     #[test]
@@ -2777,7 +3007,7 @@ mod tests {
             strs(&["src/generated/**"]),
         );
         assert_eq!(
-            out,
+            flat(&out),
             strs(&[
                 "tests/**",
                 "benches/**",
@@ -2810,12 +3040,153 @@ mod tests {
         entries.iter().map(|e| e.function.as_str()).collect()
     }
 
+    fn flat(excludes: &Excludes) -> Vec<String> {
+        excludes
+            .defaults
+            .iter()
+            .chain(&excludes.user)
+            .cloned()
+            .collect()
+    }
+
+    fn defaults_only(globs: &[&str]) -> Excludes {
+        Excludes {
+            defaults: strs(globs),
+            user: Vec::new(),
+            cli_start: 0,
+        }
+    }
+
+    /// A filter over `dirs`, each walked under `excludes`, as
+    /// `load_filtered_baseline` builds one from the run's roots.
+    fn filter_for(
+        excludes: &Excludes,
+        allow: &[String],
+        dirs: Vec<PathBuf>,
+        workspace_root: Option<&Path>,
+    ) -> Result<BaselineFilter> {
+        let roots: Vec<ScanRoot> = dirs
+            .into_iter()
+            .map(|dir| {
+                ScanRoot::new(
+                    dir,
+                    excludes,
+                    Vec::new(),
+                    workspace_root.map(Path::to_path_buf),
+                )
+            })
+            .collect();
+        BaselineFilter::new(&roots, allow)
+    }
+
     #[test]
-    fn baseline_filter_drops_root_level_target_dirs() {
-        let filter = BaselineFilter::new(
-            &strs(&["tests/**", "benches/**", "examples/**"]),
+    fn relative_baseline_paths_resolve_below_the_workspace_root() {
+        let at = |file: &str| Location {
+            file: PathBuf::from(file),
+            start_line: 1,
+            end_line: 9,
+            name: "f".into(),
+        };
+        let baseline = || Baseline {
+            entries: vec![
+                baseline_entry("crates/a/src/lib.rs", "rel"),
+                baseline_entry("/abs/x.rs", "abs"),
+                baseline_entry("crates\\b\\src\\lib.rs", "windows"),
+            ],
+            try_weight: 1.0,
+            duplicate_groups: Some(vec![vec![at("crates/a/src/lib.rs"), at("/abs/x.rs")]]),
+        };
+        let files = |b: &Baseline| -> (Vec<PathBuf>, Vec<PathBuf>) {
+            (
+                b.entries.iter().map(|e| e.file.clone()).collect(),
+                b.duplicate_groups.as_ref().unwrap()[0]
+                    .iter()
+                    .map(|m| m.file.clone())
+                    .collect(),
+            )
+        };
+        let mut resolved = baseline();
+        resolve_relative_paths(&mut resolved, Some(Path::new("/ws")));
+        let expected = vec![
+            PathBuf::from("/ws/crates/a/src/lib.rs"),
+            PathBuf::from("/abs/x.rs"),
+        ];
+        let (entries, members) = files(&resolved);
+        assert_eq!(entries[..2], expected[..]);
+        assert_eq!(entries[2], PathBuf::from("/ws/crates/b/src/lib.rs"));
+        assert_eq!(members, expected);
+        let mut untouched = baseline();
+        resolve_relative_paths(&mut untouched, None);
+        assert_eq!(files(&untouched), files(&baseline()));
+    }
+
+    #[test]
+    fn baseline_filter_matches_a_user_glob_below_a_single_root() {
+        let filter = filter_for(
+            &Excludes {
+                defaults: Vec::new(),
+                user: strs(&["src/generated/**"]),
+                cli_start: 0,
+            },
             &[],
             vec![PathBuf::from(".")],
+            None,
+        )
+        .unwrap();
+        let mut entries = vec![
+            baseline_entry("./src/generated/api.rs", "dropped"),
+            baseline_entry("./src/lib.rs", "kept"),
+        ];
+        filter.retain(&mut entries);
+        assert_eq!(names(&entries), ["kept"]);
+    }
+
+    fn workspace_filter(excludes: &Excludes) -> BaselineFilter {
+        filter_for(
+            excludes,
+            &[],
+            vec![
+                PathBuf::from("/ws/agent"),
+                PathBuf::from("/ws/tests/harness"),
+            ],
+            Some(Path::new("/ws")),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn baseline_filter_matches_a_user_glob_below_the_workspace_root() {
+        let filter = workspace_filter(&Excludes {
+            defaults: Vec::new(),
+            user: strs(&["agent/**"]),
+            cli_start: 0,
+        });
+        let mut entries = vec![
+            baseline_entry("/ws/agent/src/lib.rs", "dropped"),
+            baseline_entry("/ws/tests/harness/src/lib.rs", "kept"),
+        ];
+        filter.retain(&mut entries);
+        assert_eq!(names(&entries), ["kept"]);
+    }
+
+    #[test]
+    fn baseline_filter_never_matches_a_default_below_the_workspace_root() {
+        let filter = workspace_filter(&defaults_only(&["tests/**"]));
+        let mut entries = vec![
+            baseline_entry("/ws/tests/harness/src/lib.rs", "kept"),
+            baseline_entry("/ws/agent/tests/it.rs", "dropped"),
+        ];
+        filter.retain(&mut entries);
+        assert_eq!(names(&entries), ["kept"]);
+    }
+
+    #[test]
+    fn baseline_filter_drops_root_level_target_dirs() {
+        let filter = filter_for(
+            &defaults_only(&["tests/**", "benches/**", "examples/**"]),
+            &[],
+            vec![PathBuf::from(".")],
+            None,
         )
         .unwrap();
         let mut entries = vec![
@@ -2832,8 +3203,13 @@ mod tests {
     fn baseline_filter_keeps_nested_tests_dir_inside_src() {
         // Excludes are root-relative: `tests/**` must not match a module
         // directory that happens to be named tests/ deeper in the tree.
-        let filter =
-            BaselineFilter::new(&strs(&["tests/**"]), &[], vec![PathBuf::from(".")]).unwrap();
+        let filter = filter_for(
+            &defaults_only(&["tests/**"]),
+            &[],
+            vec![PathBuf::from(".")],
+            None,
+        )
+        .unwrap();
         let mut entries = vec![baseline_entry("./src/tests/helpers.rs", "nested_helper")];
         filter.retain(&mut entries);
         assert_eq!(names(&entries), ["nested_helper"]);
@@ -2843,10 +3219,11 @@ mod tests {
     fn baseline_filter_drops_duplicate_members_only_by_the_exclude_globs() {
         // `--allow` hides CRAP rows, and the duplicate scan never reads it:
         // a member it names is still in the current run's groups.
-        let filter = BaselineFilter::new(
-            &strs(&["tests/**"]),
+        let filter = filter_for(
+            &defaults_only(&["tests/**"]),
             &strs(&["skip_me", "gen/**"]),
             vec![PathBuf::from(".")],
+            None,
         )
         .unwrap();
         let at = |file: &str, name: &str| Location {
@@ -2876,7 +3253,8 @@ mod tests {
             end_line: 9,
             name: name.to_string(),
         };
-        let filter = BaselineFilter::new(&[], &[], vec![PathBuf::from("/ws")]).unwrap();
+        let filter =
+            filter_for(&Excludes::default(), &[], vec![PathBuf::from("/ws")], None).unwrap();
         let mut groups = vec![
             vec![
                 at("/ws/crates/alpha/src/lib.rs", "f"),
@@ -2991,8 +3369,13 @@ mod tests {
     fn baseline_filter_normalizes_backslash_paths() {
         // Baseline written on Windows: separators must be normalized before
         // glob matching, as in merge's path_key.
-        let filter =
-            BaselineFilter::new(&strs(&["tests/**"]), &[], vec![PathBuf::from(".")]).unwrap();
+        let filter = filter_for(
+            &defaults_only(&["tests/**"]),
+            &[],
+            vec![PathBuf::from(".")],
+            None,
+        )
+        .unwrap();
         let mut entries = vec![baseline_entry("tests\\integration.rs", "test_helper")];
         filter.retain(&mut entries);
         assert!(entries.is_empty(), "backslash path must match tests/**");
@@ -3003,10 +3386,11 @@ mod tests {
         // Workspace mode: globs apply relative to each member root, so
         // crates/foo/tests/it.rs is tested as tests/it.rs. A nested member
         // (crates/foo/sub) must claim its files before the shallower root.
-        let filter = BaselineFilter::new(
-            &strs(&["tests/**"]),
+        let filter = filter_for(
+            &defaults_only(&["tests/**"]),
             &[],
             vec![PathBuf::from("crates/foo"), PathBuf::from("crates/foo/sub")],
+            None,
         )
         .unwrap();
         let mut entries = vec![
@@ -3020,8 +3404,13 @@ mod tests {
 
     #[test]
     fn baseline_filter_applies_name_allow_patterns() {
-        let filter =
-            BaselineFilter::new(&[], &strs(&["generated_*"]), vec![PathBuf::from(".")]).unwrap();
+        let filter = filter_for(
+            &Excludes::default(),
+            &strs(&["generated_*"]),
+            vec![PathBuf::from(".")],
+            None,
+        )
+        .unwrap();
         let mut entries = vec![
             baseline_entry("src/codegen.rs", "generated_parse_v1"),
             baseline_entry("src/lib.rs", "kept"),
@@ -3034,9 +3423,13 @@ mod tests {
     fn baseline_filter_applies_path_allow_patterns() {
         // Path-shaped allow patterns use the same suffix matching as
         // apply_filters, so they work against absolute baseline paths too.
-        let filter =
-            BaselineFilter::new(&[], &strs(&["src/generated/**"]), vec![PathBuf::from(".")])
-                .unwrap();
+        let filter = filter_for(
+            &Excludes::default(),
+            &strs(&["src/generated/**"]),
+            vec![PathBuf::from(".")],
+            None,
+        )
+        .unwrap();
         let mut entries = vec![
             baseline_entry("/abs/proj/src/generated/api.rs", "dropped"),
             baseline_entry("/abs/proj/src/lib.rs", "kept"),
@@ -3047,7 +3440,7 @@ mod tests {
 
     #[test]
     fn baseline_filter_with_no_patterns_is_a_no_op() {
-        let filter = BaselineFilter::new(&[], &[], vec![PathBuf::from(".")]).unwrap();
+        let filter = filter_for(&Excludes::default(), &[], vec![PathBuf::from(".")], None).unwrap();
         let mut entries = vec![
             baseline_entry("tests/integration.rs", "test_helper"),
             baseline_entry("src/lib.rs", "lib_fn"),

@@ -26,7 +26,7 @@ the `uri` format from `ajv-formats` (or pass `strict: false`), then
 // cargo crap --format json
 {
   "$schema": "https://raw.githubusercontent.com/minikin/cargo-crap/main/schemas/report-v1.json",
-  "version": "0.8.0",     // the cargo-crap version that produced the report
+  "version": "0.9.0",     // the cargo-crap version that produced the report
   "entries": [
     {
       "file": "src/lib.rs",
@@ -47,7 +47,7 @@ the `uri` format from `ajv-formats` (or pass `strict: false`), then
 // cargo crap --format json --baseline baseline.json
 {
   "$schema": "https://raw.githubusercontent.com/minikin/cargo-crap/main/schemas/delta-v2.json",
-  "version": "0.8.0",     // the cargo-crap version that produced the report
+  "version": "0.9.0",     // the cargo-crap version that produced the report
   "entries": [ /* DeltaEntry — current + baseline_crap + delta + status (+ optional previous_file when moved) */ ],
   "removed": [ /* RemovedEntry — function, file, baseline_crap */ ]
 }
@@ -55,6 +55,17 @@ the `uri` format from `ajv-formats` (or pass `strict: false`), then
 
 `--baseline` only reads files in this envelope shape. Bare-array baselines
 from older runs must be regenerated.
+
+Paths (`file`, `previous_file`, `duplicates[].first_file` /
+`second_file`, each duplicate group member's `file`, and the analyzed-file
+examples under `diagnostics`) are written as `--path` gave them in
+single-path mode (`./src/lib.rs` under the default `--path .`). In
+`--workspace` and `-p` mode they are relative to the workspace root
+(`crates/core/src/lib.rs`), except for a member outside the workspace root,
+which keeps its absolute path. A workspace-mode `--baseline` reads a
+relative path against the workspace root, so a baseline recorded in one
+checkout compares cleanly in another, and an absolute baseline from an
+older version still compares cleanly in the checkout that recorded it.
 
 Both envelopes also carry an optional `diagnostics` object whenever `--lcov`
 was supplied: analyzed/LCOV/matched file counts plus bounded example lists
